@@ -72,7 +72,9 @@ def is_numeric_datatype(data_type: DataType):
 
 
 # pylint: disable=too-many-return-statements
-def infer_dtype_by_scaladata(data: Any):
+def infer_dtype_by_scalar_data(data: Any):
+    if isinstance(data, list):
+        return DataType.ARRAY
     if isinstance(data, float):
         return DataType.DOUBLE
     if isinstance(data, bool):
@@ -108,7 +110,7 @@ def infer_dtype_by_scaladata(data: Any):
 def infer_dtype_bydata(data: Any):
     d_type = DataType.UNKNOWN
     if is_scalar(data):
-        return infer_dtype_by_scaladata(data)
+        return infer_dtype_by_scalar_data(data)
 
     if isinstance(data, dict):
         return DataType.JSON
@@ -130,7 +132,7 @@ def infer_dtype_bydata(data: Any):
             elem = None
 
         if elem is not None and is_scalar(elem):
-            d_type = infer_dtype_by_scaladata(elem)
+            d_type = infer_dtype_by_scalar_data(elem)
 
     if d_type == DataType.UNKNOWN:
         _dtype = getattr(data, "dtype", None)

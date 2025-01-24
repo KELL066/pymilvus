@@ -26,7 +26,9 @@ The following collection shows Milvus versions and recommended PyMilvus versions
 | 2.0.\* | 2.0.2 |
 | 2.1.\* | 2.1.3 |
 | 2.2.\* | 2.2.15 |
-| 2.3.\* | 2.3.4 |
+| 2.3.\* | 2.3.7 |
+| 2.4.\* | 2.4.10 |
+| 2.5.\* | 2.5.0 |
 
 
 ## Installation
@@ -35,12 +37,14 @@ You can install PyMilvus via `pip` or `pip3` for Python 3.8+:
 
 ```shell
 $ pip3 install pymilvus
+$ pip3 install pymilvus[model] # for milvus-model
+$ pip3 install pymilvus[bulk_writer] # for bulk_writer
 ```
 
 You can install a specific version of PyMilvus by:
 
 ```shell
-$ pip3 install pymilvus==2.3.4
+$ pip3 install pymilvus==2.4.10
 ```
 
 You can upgrade PyMilvus to the latest version by:
@@ -59,8 +63,6 @@ $ git submodule update --init
 ```
 
 Q2. How to generate python files from milvus-proto?
-
-**Before generating python files, please install requirements in `requirements.txt`**
 
 A2.
 ```shell
@@ -83,15 +85,28 @@ make lint
 
 Q5. How to fix the coding styles?
 
-Q5
+A5
 ```shell
 make format
 ```
 
+Q6. How to run unittests?
+
+A6
+```shell
+$ pip install ".[dev]"
+$ make unittest
+```
+Q7. `zsh: no matches found: pymilvus[model]`, how do I solve this?
+
+A7
+```shell
+$ pip install "pymilvus[model]"
+```
 
 ## Documentation
 
-Documentation is available online: https://milvus.io/api-reference/pymilvus/v2.3.x/About.md
+Documentation is available online: https://milvus.io/api-reference/pymilvus/v2.4.x/About.md
 
 ## Developing package releases
 

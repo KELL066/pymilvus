@@ -27,6 +27,18 @@ def deprecated(func: Any):
     return inner
 
 
+# Reference: https://grpc.github.io/grpc/python/grpc.html#grpc-status-code
+IGNORE_RETRY_CODES = (
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+    grpc.StatusCode.PERMISSION_DENIED,
+    grpc.StatusCode.UNAUTHENTICATED,
+    grpc.StatusCode.INVALID_ARGUMENT,
+    grpc.StatusCode.ALREADY_EXISTS,
+    grpc.StatusCode.RESOURCE_EXHAUSTED,
+    grpc.StatusCode.UNIMPLEMENTED,
+)
+
+
 def retry_on_rpc_failure(
     *,
     retry_times: int = 75,
@@ -41,8 +53,8 @@ def retry_on_rpc_failure(
         def handler(*args, **kwargs):
             # This has to make sure every timeout parameter is passing
             # throught kwargs form as `timeout=10`
-            _timeout = kwargs.get("timeout", None)
-            _retry_times = kwargs.get("retry_times", None)
+            _timeout = kwargs.get("timeout")
+            _retry_times = kwargs.get("retry_times")
             _retry_on_rate_limit = kwargs.get("retry_on_rate_limit", True)
 
             retry_timeout = _timeout if _timeout is not None and isinstance(_timeout, int) else None
@@ -73,15 +85,8 @@ def retry_on_rpc_failure(
                 try:
                     return func(*args, **kwargs)
                 except grpc.RpcError as e:
-                    # Reference: https://grpc.github.io/grpc/python/grpc.html#grpc-status-code
-                    if e.code() in (
-                        grpc.StatusCode.DEADLINE_EXCEEDED,
-                        grpc.StatusCode.PERMISSION_DENIED,
-                        grpc.StatusCode.UNAUTHENTICATED,
-                        grpc.StatusCode.INVALID_ARGUMENT,
-                        grpc.StatusCode.ALREADY_EXISTS,
-                        grpc.StatusCode.RESOURCE_EXHAUSTED,
-                    ):
+                    # Do not retry on these codes
+                    if e.code() in IGNORE_RETRY_CODES:
                         raise e from e
                     if timeout(start_time):
                         raise MilvusException(e.code, f"{to_msg}, message={e.details()}") from e
@@ -91,7 +96,8 @@ def retry_on_rpc_failure(
                             f"[{func.__name__}] retry:{counter}, cost: {back_off:.2f}s, "
                             f"reason: <{e.__class__.__name__}: {e.code()}, {e.details()}>"
                         )
-                        LOGGER.warning(WARNING_COLOR.format(retry_msg))
+                        # retry msg uses info level
+                        LOGGER.info(retry_msg)
 
                     time.sleep(back_off)
                     back_off = min(back_off * back_off_multiplier, max_back_off)
@@ -161,8 +167,8 @@ def tracing_request():
     def wrapper(func: Callable):
         @functools.wraps(func)
         def handler(self: Callable, *args, **kwargs):
-            level = kwargs.get("log_level", None)
-            req_id = kwargs.get("client_request_id", None)
+            level = kwargs.get("log_level")
+            req_id = kwargs.get("client_request_id")
             if level:
                 self.set_onetime_loglevel(level)
             if req_id:
@@ -201,8 +207,8 @@ def upgrade_reminder(func: Callable):
         except grpc.RpcError as e:
             if e.code() == grpc.StatusCode.UNIMPLEMENTED:
                 msg = (
-                    "this version of sdk is incompatible with server, "
-                    "please downgrade your sdk or upgrade your server"
+                    "Incorrect port or sdk is incompatible with server, "
+                    "please check your port or downgrade your sdk or upgrade your server"
                 )
                 raise MilvusException(message=msg) from e
             raise e from e

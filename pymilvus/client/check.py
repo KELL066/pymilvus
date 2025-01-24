@@ -5,7 +5,29 @@ from typing import Any, Callable, Union
 from pymilvus.exceptions import ParamError
 from pymilvus.grpc_gen import milvus_pb2 as milvus_types
 
+from . import entity_helper
 from .singleton_utils import Singleton
+
+
+def validate_strs(**kwargs):
+    """validate if all values are legal non-emtpy str"""
+    invalid_pair = {k: v for k, v in kwargs.items() if not validate_str(v)}
+    if invalid_pair:
+        msg = f"Illegal str variables: {invalid_pair}, expect non-empty str"
+        raise ParamError(message=msg)
+
+
+def validate_nullable_strs(**kwargs):
+    """validate if all values are either None or legal non-empty str"""
+    invalid_pair = {k: v for k, v in kwargs.items() if v is not None and not validate_str(v)}
+    if invalid_pair:
+        msg = f"Illegal nullable str variables: {invalid_pair}, expect None or non-empty str"
+        raise ParamError(message=msg)
+
+
+def validate_str(var: Any) -> bool:
+    """check if a variable is legal non-empty str"""
+    return var and isinstance(var, str)
 
 
 def is_legal_address(addr: Any) -> bool:
@@ -16,20 +38,11 @@ def is_legal_address(addr: Any) -> bool:
     if len(a) != 2:
         return False
 
-    if not is_legal_host(a[0]) or not is_legal_port(a[1]):
-        return False
-
-    return True
+    return is_legal_host(a[0]) and is_legal_port(a[1])
 
 
 def is_legal_host(host: Any) -> bool:
-    if not isinstance(host, str):
-        return False
-
-    if len(host) == 0:
-        return False
-
-    return True
+    return isinstance(host, str) and len(host) > 0 and (":" not in host)
 
 
 def is_legal_port(port: Any) -> bool:
@@ -41,24 +54,6 @@ def is_legal_port(port: Any) -> bool:
         else:
             return True
     return False
-
-
-def is_legal_vector(array: Any) -> bool:
-    if not array or not isinstance(array, list) or len(array) == 0:
-        return False
-
-    return True
-
-
-def is_legal_bin_vector(array: Any) -> bool:
-    if not array or not isinstance(array, bytes) or len(array) == 0:
-        return False
-
-    return True
-
-
-def is_legal_numpy_array(array: Any) -> bool:
-    return not (array is None or array.size == 0)
 
 
 def int_or_str(item: Union[int, str]) -> str:
@@ -78,7 +73,12 @@ def is_correct_date_str(param: str) -> bool:
 
 
 def is_legal_dimension(dim: Any) -> bool:
-    return isinstance(dim, int)
+    try:
+        _ = int(dim)
+    except ValueError:
+        return False
+
+    return True
 
 
 def is_legal_index_size(index_size: Any) -> bool:
@@ -86,7 +86,7 @@ def is_legal_index_size(index_size: Any) -> bool:
 
 
 def is_legal_table_name(table_name: Any) -> bool:
-    return table_name and isinstance(table_name, str)
+    return validate_str(table_name)
 
 
 def is_legal_db_name(db_name: Any) -> bool:
@@ -100,6 +100,10 @@ def is_legal_field_name(field_name: Any) -> bool:
 
 def is_legal_index_name(index_name: Any) -> bool:
     return index_name and isinstance(index_name, str)
+
+
+def is_legal_timeout(timeout: Any) -> bool:
+    return timeout is None or isinstance(timeout, (int, float))
 
 
 def is_legal_nlist(nlist: Any) -> bool:
@@ -148,6 +152,10 @@ def is_legal_max_iterations(max_iterations: Any) -> bool:
     return isinstance(max_iterations, int)
 
 
+def is_legal_drop_ratio(drop_ratio: Any) -> bool:
+    return isinstance(drop_ratio, float) and 0 <= drop_ratio < 1
+
+
 def is_legal_team_size(team_size: Any) -> bool:
     return isinstance(team_size, int)
 
@@ -175,10 +183,8 @@ def parser_range_date(date: Union[str, datetime.date]) -> str:
 def is_legal_date_range(start: str, end: str) -> bool:
     start_date = datetime.datetime.strptime(start, "%Y-%m-%d")
     end_date = datetime.datetime.strptime(end, "%Y-%m-%d")
-    if (end_date - start_date).days < 0:
-        return False
 
-    return True
+    return (end_date - start_date).days >= 0
 
 
 def is_legal_partition_name(tag: Any) -> bool:
@@ -196,10 +202,13 @@ def is_legal_anns_field(field: Any) -> bool:
 def is_legal_search_data(data: Any) -> bool:
     import numpy as np
 
+    if entity_helper.entity_is_sparse_matrix(data):
+        return True
+
     if not isinstance(data, (list, np.ndarray)):
         return False
 
-    return all(isinstance(vector, (list, bytes, np.ndarray)) for vector in data)
+    return all(isinstance(vector, (list, bytes, np.ndarray, str)) for vector in data)
 
 
 def is_legal_output_fields(output_fields: Any) -> bool:
@@ -235,7 +244,7 @@ def is_legal_round_decimal(round_decimal: Any) -> bool:
 
 
 def is_legal_guarantee_timestamp(ts: Any) -> bool:
-    return ts is None or isinstance(ts, int) and ts >= 0
+    return (ts is None) or (isinstance(ts, int) and ts >= 0)
 
 
 def is_legal_user(user: Any) -> bool:
@@ -288,11 +297,31 @@ def is_legal_operate_privilege_type(operate_privilege_type: Any) -> bool:
     )
 
 
+def is_legal_privilege_group(privilege_group: Any) -> bool:
+    return privilege_group and isinstance(privilege_group, str)
+
+
+def is_legal_privileges(privileges: Any) -> bool:
+    return (
+        privileges
+        and isinstance(privileges, list)
+        and all(is_legal_privilege(p) for p in privileges)
+    )
+
+
+def is_legal_operate_privilege_group_type(operate_privilege_group_type: Any) -> bool:
+    return operate_privilege_group_type in (
+        milvus_types.OperatePrivilegeGroupType.AddPrivilegesToGroup,
+        milvus_types.OperatePrivilegeGroupType.RemovePrivilegesFromGroup,
+    )
+
+
 class ParamChecker(metaclass=Singleton):
     def __init__(self) -> None:
         self.check_dict = {
             "db_name": is_legal_db_name,
             "collection_name": is_legal_table_name,
+            "alias": is_legal_table_name,
             "field_name": is_legal_field_name,
             "dimension": is_legal_dimension,
             "index_file_size": is_legal_index_size,
@@ -328,6 +357,12 @@ class ParamChecker(metaclass=Singleton):
             "max_iterations": is_legal_max_iterations,
             "team_size": is_legal_team_size,
             "index_name": is_legal_index_name,
+            "timeout": is_legal_timeout,
+            "drop_ratio_build": is_legal_drop_ratio,
+            "drop_ratio_search": is_legal_drop_ratio,
+            "privilege_group": is_legal_privilege_group,
+            "privileges": is_legal_privileges,
+            "operate_privilege_group_type": is_legal_operate_privilege_group_type,
         }
 
     def check(self, key: str, value: Callable):

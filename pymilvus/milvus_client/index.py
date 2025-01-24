@@ -1,8 +1,8 @@
 class IndexParam:
     def __init__(self, field_name: str, index_type: str, index_name: str, **kwargs):
         self._field_name = field_name
-        self._index_name = index_name
         self._index_type = index_type
+        self._index_name = index_name
         self._kwargs = kwargs
 
     @property
@@ -18,8 +18,10 @@ class IndexParam:
         return self._index_type
 
     def __iter__(self):
-        yield "field_name", self._field_name
-        yield "index_name", self._index_name
+        yield "field_name", self.field_name
+        if self.index_type:
+            yield "index_type", self.index_type
+        yield "index_name", self.index_name
         yield from self._kwargs.items()
 
     def __str__(self):
@@ -35,8 +37,10 @@ class IndexParam:
 
 
 class IndexParams:
-    def __init__(self):
+    def __init__(self, field_name: str = "", **kwargs):
         self._indexes = {}
+        if field_name:
+            self.add_index(field_name, **kwargs)
 
     def add_index(self, field_name: str, index_type: str = "", index_name: str = "", **kwargs):
         index_param = IndexParam(field_name, index_type, index_name, **kwargs)

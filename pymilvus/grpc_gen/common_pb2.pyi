@@ -66,6 +66,11 @@ class ErrorCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     TimeTickLongDelay: _ClassVar[ErrorCode]
     NotReadyServe: _ClassVar[ErrorCode]
     NotReadyCoordActivating: _ClassVar[ErrorCode]
+    CreatePrivilegeGroupFailure: _ClassVar[ErrorCode]
+    DropPrivilegeGroupFailure: _ClassVar[ErrorCode]
+    ListPrivilegeGroupsFailure: _ClassVar[ErrorCode]
+    OperatePrivilegeGroupFailure: _ClassVar[ErrorCode]
+    SchemaMismatch: _ClassVar[ErrorCode]
     DataCoordNA: _ClassVar[ErrorCode]
     DDRequestRace: _ClassVar[ErrorCode]
 
@@ -89,6 +94,13 @@ class SegmentState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     Dropped: _ClassVar[SegmentState]
     Importing: _ClassVar[SegmentState]
 
+class SegmentLevel(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    Legacy: _ClassVar[SegmentLevel]
+    L0: _ClassVar[SegmentLevel]
+    L1: _ClassVar[SegmentLevel]
+    L2: _ClassVar[SegmentLevel]
+
 class PlaceholderType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     None: _ClassVar[PlaceholderType]
@@ -96,6 +108,8 @@ class PlaceholderType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     FloatVector: _ClassVar[PlaceholderType]
     Float16Vector: _ClassVar[PlaceholderType]
     BFloat16Vector: _ClassVar[PlaceholderType]
+    SparseFloatVector: _ClassVar[PlaceholderType]
+    Int8Vector: _ClassVar[PlaceholderType]
     Int64: _ClassVar[PlaceholderType]
     VarChar: _ClassVar[PlaceholderType]
 
@@ -117,6 +131,7 @@ class MsgType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     RenameCollection: _ClassVar[MsgType]
     DescribeAlias: _ClassVar[MsgType]
     ListAliases: _ClassVar[MsgType]
+    AlterCollectionField: _ClassVar[MsgType]
     CreatePartition: _ClassVar[MsgType]
     DropPartition: _ClassVar[MsgType]
     HasPartition: _ClassVar[MsgType]
@@ -143,6 +158,9 @@ class MsgType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     Flush: _ClassVar[MsgType]
     ResendSegmentStats: _ClassVar[MsgType]
     Upsert: _ClassVar[MsgType]
+    ManualFlush: _ClassVar[MsgType]
+    FlushSegment: _ClassVar[MsgType]
+    CreateSegment: _ClassVar[MsgType]
     Search: _ClassVar[MsgType]
     SearchResult: _ClassVar[MsgType]
     GetIndexState: _ClassVar[MsgType]
@@ -178,6 +196,7 @@ class MsgType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     Connect: _ClassVar[MsgType]
     ListClientInfos: _ClassVar[MsgType]
     AllocTimestamp: _ClassVar[MsgType]
+    Replicate: _ClassVar[MsgType]
     CreateCredential: _ClassVar[MsgType]
     GetCredential: _ClassVar[MsgType]
     DeleteCredential: _ClassVar[MsgType]
@@ -193,15 +212,22 @@ class MsgType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     SelectGrant: _ClassVar[MsgType]
     RefreshPolicyInfoCache: _ClassVar[MsgType]
     ListPolicy: _ClassVar[MsgType]
+    CreatePrivilegeGroup: _ClassVar[MsgType]
+    DropPrivilegeGroup: _ClassVar[MsgType]
+    ListPrivilegeGroups: _ClassVar[MsgType]
+    OperatePrivilegeGroup: _ClassVar[MsgType]
     CreateResourceGroup: _ClassVar[MsgType]
     DropResourceGroup: _ClassVar[MsgType]
     ListResourceGroups: _ClassVar[MsgType]
     DescribeResourceGroup: _ClassVar[MsgType]
     TransferNode: _ClassVar[MsgType]
     TransferReplica: _ClassVar[MsgType]
+    UpdateResourceGroups: _ClassVar[MsgType]
     CreateDatabase: _ClassVar[MsgType]
     DropDatabase: _ClassVar[MsgType]
     ListDatabases: _ClassVar[MsgType]
+    AlterDatabase: _ClassVar[MsgType]
+    DescribeDatabase: _ClassVar[MsgType]
 
 class DslType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -284,6 +310,33 @@ class ObjectPrivilege(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     PrivilegeShowPartitions: _ClassVar[ObjectPrivilege]
     PrivilegeHasPartition: _ClassVar[ObjectPrivilege]
     PrivilegeGetFlushState: _ClassVar[ObjectPrivilege]
+    PrivilegeCreateAlias: _ClassVar[ObjectPrivilege]
+    PrivilegeDropAlias: _ClassVar[ObjectPrivilege]
+    PrivilegeDescribeAlias: _ClassVar[ObjectPrivilege]
+    PrivilegeListAliases: _ClassVar[ObjectPrivilege]
+    PrivilegeUpdateResourceGroups: _ClassVar[ObjectPrivilege]
+    PrivilegeAlterDatabase: _ClassVar[ObjectPrivilege]
+    PrivilegeDescribeDatabase: _ClassVar[ObjectPrivilege]
+    PrivilegeBackupRBAC: _ClassVar[ObjectPrivilege]
+    PrivilegeRestoreRBAC: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupReadOnly: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupReadWrite: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupAdmin: _ClassVar[ObjectPrivilege]
+    PrivilegeCreatePrivilegeGroup: _ClassVar[ObjectPrivilege]
+    PrivilegeDropPrivilegeGroup: _ClassVar[ObjectPrivilege]
+    PrivilegeListPrivilegeGroups: _ClassVar[ObjectPrivilege]
+    PrivilegeOperatePrivilegeGroup: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupClusterReadOnly: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupClusterReadWrite: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupClusterAdmin: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupDatabaseReadOnly: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupDatabaseReadWrite: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupDatabaseAdmin: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupCollectionReadOnly: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupCollectionReadWrite: _ClassVar[ObjectPrivilege]
+    PrivilegeGroupCollectionAdmin: _ClassVar[ObjectPrivilege]
+    PrivilegeGetImportProgress: _ClassVar[ObjectPrivilege]
+    PrivilegeListImport: _ClassVar[ObjectPrivilege]
 
 class StateCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -356,6 +409,11 @@ DiskQuotaExhausted: ErrorCode
 TimeTickLongDelay: ErrorCode
 NotReadyServe: ErrorCode
 NotReadyCoordActivating: ErrorCode
+CreatePrivilegeGroupFailure: ErrorCode
+DropPrivilegeGroupFailure: ErrorCode
+ListPrivilegeGroupsFailure: ErrorCode
+OperatePrivilegeGroupFailure: ErrorCode
+SchemaMismatch: ErrorCode
 DataCoordNA: ErrorCode
 DDRequestRace: ErrorCode
 IndexStateNone: IndexState
@@ -372,11 +430,17 @@ Flushed: SegmentState
 Flushing: SegmentState
 Dropped: SegmentState
 Importing: SegmentState
+Legacy: SegmentLevel
+L0: SegmentLevel
+L1: SegmentLevel
+L2: SegmentLevel
 None: PlaceholderType
 BinaryVector: PlaceholderType
 FloatVector: PlaceholderType
 Float16Vector: PlaceholderType
 BFloat16Vector: PlaceholderType
+SparseFloatVector: PlaceholderType
+Int8Vector: PlaceholderType
 Int64: PlaceholderType
 VarChar: PlaceholderType
 Undefined: MsgType
@@ -395,6 +459,7 @@ AlterCollection: MsgType
 RenameCollection: MsgType
 DescribeAlias: MsgType
 ListAliases: MsgType
+AlterCollectionField: MsgType
 CreatePartition: MsgType
 DropPartition: MsgType
 HasPartition: MsgType
@@ -421,6 +486,9 @@ Delete: MsgType
 Flush: MsgType
 ResendSegmentStats: MsgType
 Upsert: MsgType
+ManualFlush: MsgType
+FlushSegment: MsgType
+CreateSegment: MsgType
 Search: MsgType
 SearchResult: MsgType
 GetIndexState: MsgType
@@ -456,6 +524,7 @@ DataNodeTt: MsgType
 Connect: MsgType
 ListClientInfos: MsgType
 AllocTimestamp: MsgType
+Replicate: MsgType
 CreateCredential: MsgType
 GetCredential: MsgType
 DeleteCredential: MsgType
@@ -471,15 +540,22 @@ OperatePrivilege: MsgType
 SelectGrant: MsgType
 RefreshPolicyInfoCache: MsgType
 ListPolicy: MsgType
+CreatePrivilegeGroup: MsgType
+DropPrivilegeGroup: MsgType
+ListPrivilegeGroups: MsgType
+OperatePrivilegeGroup: MsgType
 CreateResourceGroup: MsgType
 DropResourceGroup: MsgType
 ListResourceGroups: MsgType
 DescribeResourceGroup: MsgType
 TransferNode: MsgType
 TransferReplica: MsgType
+UpdateResourceGroups: MsgType
 CreateDatabase: MsgType
 DropDatabase: MsgType
 ListDatabases: MsgType
+AlterDatabase: MsgType
+DescribeDatabase: MsgType
 Dsl: DslType
 BoolExprV1: DslType
 UndefiedState: CompactionState
@@ -544,6 +620,33 @@ PrivilegeDropPartition: ObjectPrivilege
 PrivilegeShowPartitions: ObjectPrivilege
 PrivilegeHasPartition: ObjectPrivilege
 PrivilegeGetFlushState: ObjectPrivilege
+PrivilegeCreateAlias: ObjectPrivilege
+PrivilegeDropAlias: ObjectPrivilege
+PrivilegeDescribeAlias: ObjectPrivilege
+PrivilegeListAliases: ObjectPrivilege
+PrivilegeUpdateResourceGroups: ObjectPrivilege
+PrivilegeAlterDatabase: ObjectPrivilege
+PrivilegeDescribeDatabase: ObjectPrivilege
+PrivilegeBackupRBAC: ObjectPrivilege
+PrivilegeRestoreRBAC: ObjectPrivilege
+PrivilegeGroupReadOnly: ObjectPrivilege
+PrivilegeGroupReadWrite: ObjectPrivilege
+PrivilegeGroupAdmin: ObjectPrivilege
+PrivilegeCreatePrivilegeGroup: ObjectPrivilege
+PrivilegeDropPrivilegeGroup: ObjectPrivilege
+PrivilegeListPrivilegeGroups: ObjectPrivilege
+PrivilegeOperatePrivilegeGroup: ObjectPrivilege
+PrivilegeGroupClusterReadOnly: ObjectPrivilege
+PrivilegeGroupClusterReadWrite: ObjectPrivilege
+PrivilegeGroupClusterAdmin: ObjectPrivilege
+PrivilegeGroupDatabaseReadOnly: ObjectPrivilege
+PrivilegeGroupDatabaseReadWrite: ObjectPrivilege
+PrivilegeGroupDatabaseAdmin: ObjectPrivilege
+PrivilegeGroupCollectionReadOnly: ObjectPrivilege
+PrivilegeGroupCollectionReadWrite: ObjectPrivilege
+PrivilegeGroupCollectionAdmin: ObjectPrivilege
+PrivilegeGetImportProgress: ObjectPrivilege
+PrivilegeListImport: ObjectPrivilege
 Initializing: StateCode
 Healthy: StateCode
 Abnormal: StateCode
@@ -557,18 +660,27 @@ PRIVILEGE_EXT_OBJ_FIELD_NUMBER: _ClassVar[int]
 privilege_ext_obj: _descriptor.FieldDescriptor
 
 class Status(_message.Message):
-    __slots__ = ("error_code", "reason", "code", "retriable", "detail")
+    __slots__ = ("error_code", "reason", "code", "retriable", "detail", "extra_info")
+    class ExtraInfoEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
     ERROR_CODE_FIELD_NUMBER: _ClassVar[int]
     REASON_FIELD_NUMBER: _ClassVar[int]
     CODE_FIELD_NUMBER: _ClassVar[int]
     RETRIABLE_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
+    EXTRA_INFO_FIELD_NUMBER: _ClassVar[int]
     error_code: ErrorCode
     reason: str
     code: int
     retriable: bool
     detail: str
-    def __init__(self, error_code: _Optional[_Union[ErrorCode, str]] = ..., reason: _Optional[str] = ..., code: _Optional[int] = ..., retriable: bool = ..., detail: _Optional[str] = ...) -> None: ...
+    extra_info: _containers.ScalarMap[str, str]
+    def __init__(self, error_code: _Optional[_Union[ErrorCode, str]] = ..., reason: _Optional[str] = ..., code: _Optional[int] = ..., retriable: bool = ..., detail: _Optional[str] = ..., extra_info: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class KeyValuePair(_message.Message):
     __slots__ = ("key", "value")
@@ -642,12 +754,14 @@ class MsgBase(_message.Message):
     def __init__(self, msg_type: _Optional[_Union[MsgType, str]] = ..., msgID: _Optional[int] = ..., timestamp: _Optional[int] = ..., sourceID: _Optional[int] = ..., targetID: _Optional[int] = ..., properties: _Optional[_Mapping[str, str]] = ..., replicateInfo: _Optional[_Union[ReplicateInfo, _Mapping]] = ...) -> None: ...
 
 class ReplicateInfo(_message.Message):
-    __slots__ = ("isReplicate", "msgTimestamp")
+    __slots__ = ("isReplicate", "msgTimestamp", "replicateID")
     ISREPLICATE_FIELD_NUMBER: _ClassVar[int]
     MSGTIMESTAMP_FIELD_NUMBER: _ClassVar[int]
+    REPLICATEID_FIELD_NUMBER: _ClassVar[int]
     isReplicate: bool
     msgTimestamp: int
-    def __init__(self, isReplicate: bool = ..., msgTimestamp: _Optional[int] = ...) -> None: ...
+    replicateID: str
+    def __init__(self, isReplicate: bool = ..., msgTimestamp: _Optional[int] = ..., replicateID: _Optional[str] = ...) -> None: ...
 
 class MsgHeader(_message.Message):
     __slots__ = ("base",)
@@ -728,3 +842,13 @@ class ServerInfo(_message.Message):
     deploy_mode: str
     reserved: _containers.ScalarMap[str, str]
     def __init__(self, build_tags: _Optional[str] = ..., build_time: _Optional[str] = ..., git_commit: _Optional[str] = ..., go_version: _Optional[str] = ..., deploy_mode: _Optional[str] = ..., reserved: _Optional[_Mapping[str, str]] = ...) -> None: ...
+
+class NodeInfo(_message.Message):
+    __slots__ = ("node_id", "address", "hostname")
+    NODE_ID_FIELD_NUMBER: _ClassVar[int]
+    ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    HOSTNAME_FIELD_NUMBER: _ClassVar[int]
+    node_id: int
+    address: str
+    hostname: str
+    def __init__(self, node_id: _Optional[int] = ..., address: _Optional[str] = ..., hostname: _Optional[str] = ...) -> None: ...

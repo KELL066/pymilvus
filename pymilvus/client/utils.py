@@ -1,6 +1,10 @@
 import datetime
+import importlib.util
+from copy import deepcopy
 from datetime import timedelta
-from typing import Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
+
+import ujson
 
 from pymilvus.exceptions import MilvusException, ParamError
 from pymilvus.grpc_gen.common_pb2 import Status
@@ -37,6 +41,8 @@ valid_index_params_keys = [
     "n_trees",
     "intermediate_graph_degree",
     "graph_degree",
+    "build_algo",
+    "cache_dataset_on_device",
 ]
 
 valid_binary_index_types = [
@@ -179,6 +185,22 @@ def len_of(field_data: Any) -> int:
                     message=f"Invalid vector length: total_len={total_len}, dim={dim}"
                 )
             return int(total_len / dim)
+        if field_data.vectors.HasField("bfloat16_vector") or field_data.vectors.HasField(
+            "float16_vector"
+        ):
+            total_len = (
+                len(field_data.vectors.bfloat16_vector)
+                if field_data.vectors.HasField("bfloat16_vector")
+                else len(field_data.vectors.float16_vector)
+            )
+            data_wide_in_bytes = 2
+            if total_len % (dim * data_wide_in_bytes) != 0:
+                raise MilvusException(
+                    message=f"Invalid bfloat16 or float16 vector length: total_len={total_len}, dim={dim}"
+                )
+            return int(total_len / (dim * data_wide_in_bytes))
+        if field_data.vectors.HasField("sparse_float_vector"):
+            return len(field_data.vectors.sparse_float_vector.contents)
 
         total_len = len(field_data.vectors.binary_vector)
         return int(total_len / (dim / 8))
@@ -202,7 +224,6 @@ def traverse_rows_info(fields_info: Any, entities: List):
 
         field_name = field["name"]
         location[field_name] = i
-        field_type = field["type"]
 
         if field.get("is_dynamic", False):
             is_dynamic = True
@@ -220,20 +241,6 @@ def traverse_rows_info(fields_info: Any, entities: List):
                     message=f"dynamic field enabled, {field_name} shouldn't in entities[{j}]"
                 )
 
-            value = entity.get(field_name, None)
-            if value is None:
-                raise ParamError(message=f"Field {field_name} don't match in entities[{j}]")
-
-            if field_type in [DataType.FLOAT_VECTOR, DataType.BINARY_VECTOR]:
-                field_dim = field["params"]["dim"]
-                entity_dim = len(value) if field_type == DataType.FLOAT_VECTOR else len(value) * 8
-
-                if entity_dim != field_dim:
-                    raise ParamError(
-                        message=f"Collection field dim is {field_dim}"
-                        f", but entities field dim is {entity_dim}"
-                    )
-
     # though impossible from sdk
     if primary_key_loc is None:
         raise ParamError(message="primary key not found")
@@ -241,7 +248,7 @@ def traverse_rows_info(fields_info: Any, entities: List):
     return location, primary_key_loc, auto_id_loc
 
 
-def traverse_info(fields_info: Any, entities: List):
+def traverse_info(fields_info: Any):
     location, primary_key_loc, auto_id_loc = {}, None, None
     for i, field in enumerate(fields_info):
         if field.get("is_primary", False):
@@ -250,47 +257,163 @@ def traverse_info(fields_info: Any, entities: List):
         if field.get("auto_id", False):
             auto_id_loc = i
             continue
-
-        match_flag = False
-        field_name = field["name"]
-        field_type = field["type"]
-
-        for entity in entities:
-            entity_name, entity_type = entity["name"], entity["type"]
-
-            if field_name == entity_name:
-                if field_type != entity_type:
-                    raise ParamError(
-                        message=f"Collection field type is {field_type}"
-                        f", but entities field type is {entity_type}"
-                    )
-
-                entity_dim, field_dim = 0, 0
-                if entity_type in [DataType.FLOAT_VECTOR, DataType.BINARY_VECTOR]:
-                    field_dim = field["params"]["dim"]
-                    entity_dim = len(entity["values"][0])
-
-                if entity_type in [DataType.FLOAT_VECTOR] and entity_dim != field_dim:
-                    raise ParamError(
-                        message=f"Collection field dim is {field_dim}"
-                        f", but entities field dim is {entity_dim}"
-                    )
-
-                if entity_type in [DataType.BINARY_VECTOR] and entity_dim * 8 != field_dim:
-                    raise ParamError(
-                        message=f"Collection field dim is {field_dim}"
-                        f", but entities field dim is {entity_dim * 8}"
-                    )
-
-                location[field["name"]] = i
-                match_flag = True
-                break
-
-        if not match_flag:
-            raise ParamError(message=f"Field {field['name']} don't match in entities")
+        location[field["name"]] = i
 
     return location, primary_key_loc, auto_id_loc
 
 
+def traverse_upsert_info(fields_info: Any):
+    location, primary_key_loc = {}, None
+    for i, field in enumerate(fields_info):
+        if field.get("is_primary", False):
+            primary_key_loc = i
+
+        location[field["name"]] = i
+
+    return location, primary_key_loc
+
+
+def get_params(search_params: Dict):
+    # after 2.5.2, all parameters of search_params can be written into one layer
+    # no more parameters will be written searchParams.params
+    # to ensure compatibility and milvus can still get a json format parameter
+    # try to write all the parameters under searchParams into searchParams.Params
+    params = deepcopy(search_params.get("params", {}))
+    for key, value in search_params.items():
+        if key in params:
+            if params[key] != value:
+                raise ParamError(
+                    message=f"ambiguous parameter: {key}, in search_param: {value}, in search_param.params: {params[key]}"
+                )
+        elif key != "params":
+            params[key] = value
+
+    return params
+
+
 def get_server_type(host: str):
     return ZILLIZ if (isinstance(host, str) and "zilliz" in host.lower()) else MILVUS
+
+
+def dumps(v: Union[dict, str]) -> str:
+    return ujson.dumps(v) if isinstance(v, dict) else str(v)
+
+
+class SciPyHelper:
+    _checked = False
+
+    # whether scipy.sparse.*_matrix classes exists
+    _matrix_available = False
+    # whether scipy.sparse.*_array classes exists
+    _array_available = False
+
+    @classmethod
+    def _init(cls):
+        if cls._checked:
+            return
+        scipy_spec = importlib.util.find_spec("scipy")
+        if scipy_spec is not None:
+            # when scipy is not installed, find_spec("scipy.sparse") directly
+            # throws exception instead of returning None.
+            sparse_spec = importlib.util.find_spec("scipy.sparse")
+            if sparse_spec is not None:
+                scipy_sparse = importlib.util.module_from_spec(sparse_spec)
+                sparse_spec.loader.exec_module(scipy_sparse)
+                # all scipy.sparse.*_matrix classes are introduced in the same scipy
+                # version, so we only need to check one of them.
+                cls._matrix_available = hasattr(scipy_sparse, "csr_matrix")
+                # all scipy.sparse.*_array classes are introduced in the same scipy
+                # version, so we only need to check one of them.
+                cls._array_available = hasattr(scipy_sparse, "csr_array")
+
+        cls._checked = True
+
+    @classmethod
+    def is_spmatrix(cls, data: Any):
+        cls._init()
+        if not cls._matrix_available:
+            return False
+        from scipy.sparse import isspmatrix
+
+        return isspmatrix(data)
+
+    @classmethod
+    def is_sparray(cls, data: Any):
+        cls._init()
+        if not cls._array_available:
+            return False
+        from scipy.sparse import issparse, isspmatrix
+
+        return issparse(data) and not isspmatrix(data)
+
+    @classmethod
+    def is_scipy_sparse(cls, data: Any):
+        return cls.is_spmatrix(data) or cls.is_sparray(data)
+
+
+# in search results, if output fields includes a sparse float vector field, we
+# will return a SparseRowOutputType for each entity. Using Dict for readability.
+# TODO(SPARSE): to allow the user to specify output format.
+SparseRowOutputType = Dict[int, float]
+
+
+# this import will be called only during static type checking
+if TYPE_CHECKING:
+    from scipy.sparse import (
+        bsr_array,
+        coo_array,
+        csc_array,
+        csr_array,
+        dia_array,
+        dok_array,
+        lil_array,
+        spmatrix,
+    )
+
+# we accept the following types as input for sparse matrix in user facing APIs
+# such as insert, search, etc.:
+# - scipy sparse array/matrix family: csr, csc, coo, bsr, dia, dok, lil
+# - iterable of iterables, each element(iterable) is a sparse vector with index
+#   as key and value as float.
+#   dict example: [{2: 0.33, 98: 0.72, ...}, {4: 0.45, 198: 0.52, ...}, ...]
+#   list of tuple example: [[(2, 0.33), (98, 0.72), ...], [(4, 0.45), ...], ...]
+#   both index/value can be str numbers: {'2': '3.1'}
+SparseMatrixInputType = Union[
+    Iterable[
+        Union[
+            SparseRowOutputType,
+            Iterable[Tuple[int, float]],  # only type hint, we accept int/float like types
+        ]
+    ],
+    "csc_array",
+    "coo_array",
+    "bsr_array",
+    "dia_array",
+    "dok_array",
+    "lil_array",
+    "csr_array",
+    "spmatrix",
+]
+
+
+def is_sparse_vector_type(data_type: DataType) -> bool:
+    return data_type == data_type.SPARSE_FLOAT_VECTOR
+
+
+dense_vector_type_set = {DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR}
+
+
+def is_dense_vector_type(data_type: DataType) -> bool:
+    return data_type in dense_vector_type_set
+
+
+def is_float_vector_type(data_type: DataType):
+    return is_sparse_vector_type(data_type) or is_dense_vector_type(data_type)
+
+
+def is_binary_vector_type(data_type: DataType):
+    return data_type == DataType.BINARY_VECTOR
+
+
+def is_vector_type(data_type: DataType):
+    return is_float_vector_type(data_type) or is_binary_vector_type(data_type)

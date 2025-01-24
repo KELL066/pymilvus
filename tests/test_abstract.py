@@ -17,7 +17,7 @@ class TestHit:
     ])
     def test_hit_no_fields(self, pk_dist: List[Tuple]):
         pk, dist = pk_dist
-        h = Hit(pk, dist, {})
+        h = Hit(pk, dist, {}, "id")
         assert h.id == pk
         assert h.score == dist
         assert h.distance == dist
@@ -30,9 +30,9 @@ class TestHit:
         }
 
     @pytest.mark.parametrize("pk_dist_fields", [
-        (1, 0.1, {"vector": [1., 2., 3., 4.],  "description": "This is a test", 'd_a': "dynamic a"}),
-        (2,  0.3, {"vector": [3., 4., 5., 6.], "description": "This is a test too", 'd_b': "dynamic b"}),
-        ("a", 0.4, {"vector": [4., 4., 4., 4.], "description": "This is a third test", 'd_a': "dynamic a twice"}),
+        (1, 0.1, {"vector": [1., 2., 3., 4.],  "description": "This is a test", 'd_a': "dynamic a"},"id"),
+        (2,  0.3, {"vector": [3., 4., 5., 6.], "description": "This is a test too", 'd_b': "dynamic b"}, "id"),
+        ("a", 0.4, {"vector": [4., 4., 4., 4.], "description": "This is a third test", 'd_a': "dynamic a twice"}, "id"),
     ])
     def test_hit_with_fields(self, pk_dist_fields: List[Tuple]):
         h = Hit(*pk_dist_fields)
@@ -202,3 +202,5 @@ class TestSearchResult:
         assert 1 == r[0][1].int8_field
         assert 2 == r[0][2].int16_field
         assert [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] == r[0][1].int64_array_field
+        assert 32 == len(r[0][0].entity.bfloat16_vector_field)
+        assert 32 == len(r[0][0].entity.float16_vector_field)

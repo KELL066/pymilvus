@@ -13,6 +13,7 @@
 import json
 import logging
 from threading import Lock
+from typing import Optional
 
 import numpy as np
 
@@ -37,17 +38,24 @@ class BulkWriter:
     def __init__(
         self,
         schema: CollectionSchema,
-        segment_size: int,
-        file_type: BulkFileType = BulkFileType.NPY,
+        chunk_size: int,
+        file_type: BulkFileType,
+        config: Optional[dict] = None,
         **kwargs,
     ):
         self._schema = schema
         self._buffer_size = 0
         self._buffer_row_count = 0
         self._total_row_count = 0
-        self._segment_size = segment_size
         self._file_type = file_type
         self._buffer_lock = Lock()
+        self._config = config
+
+        # the old parameter segment_size is changed to chunk_size, compatible with the legacy code
+        self._chunk_size = chunk_size
+        segment_size = kwargs.get("segment_size", 0)
+        if segment_size > 0:
+            self._chunk_size = segment_size
 
         if len(self._schema.fields) == 0:
             self._throw("collection schema fields list is empty")
@@ -71,13 +79,13 @@ class BulkWriter:
         return self._total_row_count
 
     @property
-    def segment_size(self):
-        return self._segment_size
+    def chunk_size(self):
+        return self._chunk_size
 
     def _new_buffer(self):
         old_buffer = self._buffer
         with self._buffer_lock:
-            self._buffer = Buffer(self._schema, self._file_type)
+            self._buffer = Buffer(self._schema, self._file_type, self._config)
         return old_buffer
 
     def append_row(self, row: dict, **kwargs):
@@ -111,14 +119,23 @@ class BulkWriter:
     def _verify_vector(self, x: object, field: FieldSchema):
         dtype = DataType(field.dtype)
         validator = TYPE_VALIDATOR[dtype.name]
-        dim = field.params["dim"]
-        if not validator(x, dim):
-            self._throw(
-                f"Illegal vector data for vector field: '{field.name}',"
-                f" dim is not {dim} or type mismatch"
-            )
-
-        return len(x) * 4 if dtype == DataType.FLOAT_VECTOR else len(x) / 8
+        if dtype != DataType.SPARSE_FLOAT_VECTOR:
+            dim = field.params["dim"]
+            try:
+                origin_list = validator(x, dim)
+                if dtype == DataType.FLOAT_VECTOR:
+                    return origin_list, dim * 4  # for float vector, each dim occupies 4 bytes
+                if dtype == DataType.BINARY_VECTOR:
+                    return origin_list, dim / 8  # for binary vector, 8 dim occupies 1 byte
+                return origin_list, dim * 2  # for float16 vector, each dim occupies 2 bytes
+            except MilvusException as e:
+                self._throw(f"Illegal vector data for vector field: '{field.name}': {e.message}")
+        else:
+            try:
+                validator(x)
+                return x, len(x) * 12  # for sparse vector, each key-value is int-float, 12 bytes
+            except MilvusException as e:
+                self._throw(f"Illegal vector data for vector field: '{field.name}': {e.message}")
 
     def _verify_json(self, x: object, field: FieldSchema):
         size = 0
@@ -177,16 +194,40 @@ class BulkWriter:
                     )
                 else:
                     continue
+            if field.is_function_output:
+                if field.name in row:
+                    self._throw(f"Field '{field.name}' is function output, no need to provide")
+                else:
+                    continue
 
             if field.name not in row:
                 self._throw(f"The field '{field.name}' is missed in the row")
 
             dtype = DataType(field.dtype)
-            if dtype in {DataType.BINARY_VECTOR, DataType.FLOAT_VECTOR}:
-                if isinstance(row[field.name], np.ndarray):
-                    row[field.name] = row[field.name].tolist()
 
-                row_size = row_size + self._verify_vector(row[field.name], field)
+            # deal with null (None)
+            if field.nullable and row[field.name] is None:
+                if (
+                    field.default_value is not None
+                    and field.default_value.WhichOneof("data") is not None
+                ):
+                    # set default value
+                    data_type = field.default_value.WhichOneof("data")
+                    row[field.name] = getattr(field.default_value, data_type)
+                else:
+                    # skip field check if the field is null
+                    continue
+
+            if dtype in {
+                DataType.BINARY_VECTOR,
+                DataType.FLOAT_VECTOR,
+                DataType.FLOAT16_VECTOR,
+                DataType.BFLOAT16_VECTOR,
+                DataType.SPARSE_FLOAT_VECTOR,
+            }:
+                origin_list, byte_len = self._verify_vector(row[field.name], field)
+                row[field.name] = origin_list
+                row_size = row_size + byte_len
             elif dtype == DataType.VARCHAR:
                 row_size = row_size + self._verify_varchar(row[field.name], field)
             elif dtype == DataType.JSON:

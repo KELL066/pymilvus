@@ -1,25 +1,43 @@
 import base64
 import datetime
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 
+import numpy as np
 import ujson
 
-from pymilvus.client import __version__
 from pymilvus.exceptions import DataNotMatchException, ExceptionsMessage, ParamError
 from pymilvus.grpc_gen import common_pb2 as common_types
 from pymilvus.grpc_gen import milvus_pb2 as milvus_types
 from pymilvus.grpc_gen import schema_pb2 as schema_types
 from pymilvus.orm.schema import CollectionSchema
+from pymilvus.orm.types import infer_dtype_by_scalar_data
 
-from . import blob, entity_helper, ts_utils
+from . import __version__, blob, check, entity_helper, ts_utils, utils
 from .check import check_pass_param, is_legal_collection_properties
 from .constants import (
+    COLLECTION_ID,
     DEFAULT_CONSISTENCY_LEVEL,
+    DYNAMIC_FIELD_NAME,
     GROUP_BY_FIELD,
+    GROUP_SIZE,
+    HINTS,
+    ITER_SEARCH_BATCH_SIZE_KEY,
+    ITER_SEARCH_ID_KEY,
+    ITER_SEARCH_LAST_BOUND_KEY,
+    ITER_SEARCH_V2_KEY,
+    ITERATOR_FIELD,
+    PAGE_RETAIN_ORDER_FIELD,
+    RANK_GROUP_SCORER,
     REDUCE_STOP_FOR_BEST,
+    STRICT_GROUP_SIZE,
 )
-from .types import DataType, PlaceholderType, get_consistency_level
-from .utils import traverse_info, traverse_rows_info
+from .types import (
+    DataType,
+    PlaceholderType,
+    ResourceGroupConfig,
+    get_consistency_level,
+)
+from .utils import get_params, traverse_info, traverse_upsert_info
 
 
 class Prepare:
@@ -79,7 +97,7 @@ class Prepare:
                 raise ParamError(message=msg)
             req.shards_num = num_shards
 
-        num_partitions = kwargs.get("num_partitions", None)
+        num_partitions = kwargs.get("num_partitions")
         if num_partitions is not None:
             if not isinstance(num_partitions, int) or isinstance(num_partitions, bool):
                 msg = f"invalid num_partitions type, got {type(num_partitions)}, expected int"
@@ -117,16 +135,36 @@ class Prepare:
                 data_type=f.dtype,
                 description=f.description,
                 is_primary_key=f.is_primary,
+                default_value=f.default_value,
+                nullable=f.nullable,
                 autoID=f.auto_id,
                 is_partition_key=f.is_partition_key,
                 is_dynamic=f.is_dynamic,
                 element_type=f.element_type,
+                is_clustering_key=f.is_clustering_key,
+                is_function_output=f.is_function_output,
             )
             for k, v in f.params.items():
-                kv_pair = common_types.KeyValuePair(key=str(k), value=str(v))
+                kv_pair = common_types.KeyValuePair(
+                    key=str(k) if k != "mmap_enabled" else "mmap.enabled", value=ujson.dumps(v)
+                )
                 field_schema.type_params.append(kv_pair)
 
             schema.fields.append(field_schema)
+
+        for f in fields.functions:
+            function_schema = schema_types.FunctionSchema(
+                name=f.name,
+                description=f.description,
+                type=f.type,
+                input_field_names=f.input_field_names,
+                output_field_names=f.output_field_names,
+            )
+            for k, v in f.params.items():
+                kv_pair = common_types.KeyValuePair(key=str(k), value=str(v))
+                function_schema.params.append(kv_pair)
+            schema.functions.append(function_schema)
+
         return schema
 
     @staticmethod
@@ -156,6 +194,10 @@ class Prepare:
                 raise ParamError(message=msg)
             primary_field = field_name
 
+        nullable = field.get("nullable", False)
+        if not isinstance(nullable, bool):
+            raise ParamError(message="nullable must be boolean")
+
         auto_id = field.get("auto_id", False)
         if not isinstance(auto_id, bool):
             raise ParamError(message="auto_id must be boolean")
@@ -174,12 +216,18 @@ class Prepare:
             is_primary_key=is_primary,
             autoID=auto_id,
             is_partition_key=field.get("is_partition_key", False),
+            is_clustering_key=field.get("is_clustering_key", False),
         )
 
         type_params = field.get("params", {})
         if not isinstance(type_params, dict):
             raise ParamError(message="params should be dictionary type")
-        kvs = [common_types.KeyValuePair(key=str(k), value=str(v)) for k, v in type_params.items()]
+        kvs = [
+            common_types.KeyValuePair(
+                key=str(k) if k != "mmap_enabled" else "mmap.enabled", value=str(v)
+            )
+            for k, v in type_params.items()
+        ]
         field_schema.type_params.extend(kvs)
 
         return field_schema, primary_field, auto_id_field
@@ -235,11 +283,27 @@ class Prepare:
     def alter_collection_request(
         cls,
         collection_name: str,
-        properties: Dict,
+        properties: Optional[Dict] = None,
+        delete_keys: Optional[List[str]] = None,
     ) -> milvus_types.AlterCollectionRequest:
-        kvs = [common_types.KeyValuePair(key=k, value=str(v)) for k, v in properties.items()]
+        kvs = []
+        if properties:
+            kvs = [common_types.KeyValuePair(key=k, value=str(v)) for k, v in properties.items()]
 
-        return milvus_types.AlterCollectionRequest(collection_name=collection_name, properties=kvs)
+        return milvus_types.AlterCollectionRequest(
+            collection_name=collection_name, properties=kvs, delete_keys=delete_keys
+        )
+
+    @classmethod
+    def alter_collection_field_request(
+        cls, collection_name: str, field_name: str, field_param: Dict
+    ) -> milvus_types.AlterCollectionFieldRequest:
+        kvs = []
+        if field_param:
+            kvs = [common_types.KeyValuePair(key=k, value=str(v)) for k, v in field_param.items()]
+        return milvus_types.AlterCollectionFieldRequest(
+            collection_name=collection_name, field_name=field_name, properties=kvs
+        )
 
     @classmethod
     def collection_stats_request(cls, collection_name: str):
@@ -300,7 +364,7 @@ class Prepare:
         if partition_names:
             if not isinstance(partition_names, (list,)):
                 msg = f"partition_names must be a list of strings, but got: {partition_names}"
-                raise ParamError(msg)
+                raise ParamError(message=msg)
             for partition_name in partition_names:
                 check_pass_param(partition_name=partition_name)
             req.partition_names.extend(partition_names)
@@ -346,64 +410,194 @@ class Prepare:
         return milvus_types.PartitionName(collection_name=collection_name, tag=partition_name)
 
     @staticmethod
+    def _is_input_field(field: Dict, is_upsert: bool):
+        return (not field.get("auto_id", False) or is_upsert) and not field.get(
+            "is_function_output", False
+        )
+
+    @staticmethod
+    def _function_output_field_names(fields_info: List[Dict]):
+        return [field["name"] for field in fields_info if field.get("is_function_output", False)]
+
+    @staticmethod
+    def _num_input_fields(fields_info: List[Dict], is_upsert: bool):
+        return len([field for field in fields_info if Prepare._is_input_field(field, is_upsert)])
+
+    @staticmethod
     def _parse_row_request(
         request: Union[milvus_types.InsertRequest, milvus_types.UpsertRequest],
-        fields_info: dict,
+        fields_info: List[Dict],
         enable_dynamic: bool,
         entities: List,
     ):
+        input_fields_info = [
+            field for field in fields_info if Prepare._is_input_field(field, is_upsert=False)
+        ]
+        function_output_field_names = Prepare._function_output_field_names(fields_info)
         fields_data = {
             field["name"]: schema_types.FieldData(field_name=field["name"], type=field["type"])
-            for field in fields_info
-            if not field.get("auto_id", False)
+            for field in input_fields_info
         }
-        field_info_map = {
-            field["name"]: field for field in fields_info if not field.get("auto_id", False)
-        }
+        field_info_map = {field["name"]: field for field in input_fields_info}
 
-        meta_field = (
-            schema_types.FieldData(is_dynamic=True, type=DataType.JSON) if enable_dynamic else None
-        )
-        if meta_field is not None:
-            field_info_map[meta_field.field_name] = meta_field
-            fields_data[meta_field.field_name] = meta_field
+        if enable_dynamic:
+            d_field = schema_types.FieldData(
+                field_name=DYNAMIC_FIELD_NAME, is_dynamic=True, type=DataType.JSON
+            )
+            fields_data[d_field.field_name] = d_field
+            field_info_map[d_field.field_name] = d_field
 
         try:
             for entity in entities:
+                if not isinstance(entity, Dict):
+                    msg = f"expected Dict, got '{type(entity).__name__}'"
+                    raise TypeError(msg)
                 for k, v in entity.items():
-                    if k not in fields_data and not enable_dynamic:
-                        raise DataNotMatchException(message=ExceptionsMessage.InsertUnexpectedField)
+                    if k not in fields_data:
+                        if k in function_output_field_names:
+                            raise DataNotMatchException(
+                                message=ExceptionsMessage.InsertUnexpectedFunctionOutputField % k
+                            )
+
+                        if not enable_dynamic:
+                            raise DataNotMatchException(
+                                message=ExceptionsMessage.InsertUnexpectedField % k
+                            )
 
                     if k in fields_data:
                         field_info, field_data = field_info_map[k], fields_data[k]
+                        if field_info.get("nullable", False) or field_info.get(
+                            "default_value", None
+                        ):
+                            field_data.valid_data.append(v is not None)
                         entity_helper.pack_field_value_to_field_data(v, field_data, field_info)
+                for field in input_fields_info:
+                    key = field["name"]
+                    if key in entity:
+                        continue
 
+                    field_info, field_data = field_info_map[key], fields_data[key]
+                    if field_info.get("nullable", False) or field_info.get("default_value", None):
+                        field_data.valid_data.append(False)
+                        entity_helper.pack_field_value_to_field_data(None, field_data, field_info)
+                    else:
+                        raise DataNotMatchException(
+                            message=ExceptionsMessage.InsertMissedField % key
+                        )
                 json_dict = {
                     k: v for k, v in entity.items() if k not in fields_data and enable_dynamic
                 }
 
                 if enable_dynamic:
                     json_value = entity_helper.convert_to_json(json_dict)
-                    meta_field.scalars.json_data.data.append(json_value)
+                    d_field.scalars.json_data.data.append(json_value)
 
         except (TypeError, ValueError) as e:
             raise DataNotMatchException(message=ExceptionsMessage.DataTypeInconsistent) from e
 
-        request.fields_data.extend(
-            [fields_data[field["name"]] for field in fields_info if not field.get("auto_id", False)]
-        )
+        request.fields_data.extend(fields_data.values())
+
+        expected_num_input_fields = len(input_fields_info) + (1 if enable_dynamic else 0)
+
+        if len(fields_data) != expected_num_input_fields:
+            msg = f"{ExceptionsMessage.FieldsNumInconsistent}, expected {expected_num_input_fields} fields, got {len(fields_data)}"
+            raise ParamError(message=msg)
+
+        return request
+
+    @staticmethod
+    def _parse_upsert_row_request(
+        request: Union[milvus_types.InsertRequest, milvus_types.UpsertRequest],
+        fields_info: List[Dict],
+        enable_dynamic: bool,
+        entities: List,
+    ):
+        input_fields_info = [
+            field for field in fields_info if Prepare._is_input_field(field, is_upsert=True)
+        ]
+        function_output_field_names = Prepare._function_output_field_names(fields_info)
+        fields_data = {
+            field["name"]: schema_types.FieldData(field_name=field["name"], type=field["type"])
+            for field in input_fields_info
+        }
+        field_info_map = {field["name"]: field for field in input_fields_info}
 
         if enable_dynamic:
-            request.fields_data.append(meta_field)
+            d_field = schema_types.FieldData(
+                field_name=DYNAMIC_FIELD_NAME, is_dynamic=True, type=DataType.JSON
+            )
+            fields_data[d_field.field_name] = d_field
+            field_info_map[d_field.field_name] = d_field
 
-        _, _, auto_id_loc = traverse_rows_info(fields_info, entities)
-        if auto_id_loc is not None:
-            if (enable_dynamic and len(fields_data) != len(fields_info)) or (
-                not enable_dynamic and len(fields_data) + 1 != len(fields_info)
-            ):
-                raise ParamError(ExceptionsMessage.FieldsNumInconsistent)
-        elif enable_dynamic and len(fields_data) != len(fields_info) + 1:
-            raise ParamError(ExceptionsMessage.FieldsNumInconsistent)
+        try:
+            for entity in entities:
+                if not isinstance(entity, Dict):
+                    msg = f"expected Dict, got '{type(entity).__name__}'"
+                    raise TypeError(msg)
+                for k, v in entity.items():
+                    if k not in fields_data:
+                        if k in function_output_field_names:
+                            raise DataNotMatchException(
+                                message=ExceptionsMessage.InsertUnexpectedFunctionOutputField % k
+                            )
+
+                        if not enable_dynamic:
+                            raise DataNotMatchException(
+                                message=ExceptionsMessage.InsertUnexpectedField % k
+                            )
+
+                    if k in fields_data:
+                        field_info, field_data = field_info_map[k], fields_data[k]
+                        if field_info.get("nullable", False) or field_info.get(
+                            "default_value", None
+                        ):
+                            field_data.valid_data.append(v is not None)
+                        entity_helper.pack_field_value_to_field_data(v, field_data, field_info)
+                for field in input_fields_info:
+                    key = field["name"]
+                    if key in entity:
+                        continue
+
+                    field_info, field_data = field_info_map[key], fields_data[key]
+                    if field_info.get("nullable", False) or field_info.get("default_value", None):
+                        field_data.valid_data.append(False)
+                        entity_helper.pack_field_value_to_field_data(None, field_data, field_info)
+                    else:
+                        raise DataNotMatchException(
+                            message=ExceptionsMessage.InsertMissedField % key
+                        )
+                json_dict = {
+                    k: v for k, v in entity.items() if k not in fields_data and enable_dynamic
+                }
+
+                if enable_dynamic:
+                    json_value = entity_helper.convert_to_json(json_dict)
+                    d_field.scalars.json_data.data.append(json_value)
+
+        except (TypeError, ValueError) as e:
+            raise DataNotMatchException(message=ExceptionsMessage.DataTypeInconsistent) from e
+
+        request.fields_data.extend(fields_data.values())
+
+        for _, field in enumerate(input_fields_info):
+            is_dynamic = False
+            field_name = field["name"]
+
+            if field.get("is_dynamic", False):
+                is_dynamic = True
+
+            for j, entity in enumerate(entities):
+                if is_dynamic and field_name in entity:
+                    raise ParamError(
+                        message=f"dynamic field enabled, {field_name} shouldn't in entities[{j}]"
+                    )
+
+        expected_num_input_fields = len(input_fields_info) + (1 if enable_dynamic else 0)
+
+        if len(fields_data) != expected_num_input_fields:
+            msg = f"{ExceptionsMessage.FieldsNumInconsistent}, expected {expected_num_input_fields} fields, got {len(fields_data)}"
+            raise ParamError(message=msg)
+
         return request
 
     @classmethod
@@ -412,16 +606,20 @@ class Prepare:
         collection_name: str,
         entities: List,
         partition_name: str,
-        fields_info: Any,
+        fields_info: Dict,
+        schema_timestamp: int = 0,
         enable_dynamic: bool = False,
     ):
         if not fields_info:
             raise ParamError(message="Missing collection meta to validate entities")
 
         # insert_request.hash_keys won't be filled in client.
-        tag = partition_name if isinstance(partition_name, str) else ""
+        p_name = partition_name if isinstance(partition_name, str) else ""
         request = milvus_types.InsertRequest(
-            collection_name=collection_name, partition_name=tag, num_rows=len(entities)
+            collection_name=collection_name,
+            partition_name=p_name,
+            num_rows=len(entities),
+            schema_timestamp=schema_timestamp,
         )
 
         return cls._parse_row_request(request, fields_info, enable_dynamic, entities)
@@ -434,28 +632,32 @@ class Prepare:
         partition_name: str,
         fields_info: Any,
         enable_dynamic: bool = False,
+        schema_timestamp: int = 0,
     ):
         if not fields_info:
             raise ParamError(message="Missing collection meta to validate entities")
 
         # upsert_request.hash_keys won't be filled in client.
-        tag = partition_name if isinstance(partition_name, str) else ""
+        p_name = partition_name if isinstance(partition_name, str) else ""
         request = milvus_types.UpsertRequest(
-            collection_name=collection_name, partition_name=tag, num_rows=len(entities)
+            collection_name=collection_name,
+            partition_name=p_name,
+            num_rows=len(entities),
+            schema_timestamp=schema_timestamp,
         )
 
-        return cls._parse_row_request(request, fields_info, enable_dynamic, entities)
+        return cls._parse_upsert_row_request(request, fields_info, enable_dynamic, entities)
 
     @staticmethod
-    def _pre_batch_check(
+    def _pre_insert_batch_check(
         entities: List,
         fields_info: Any,
     ):
         for entity in entities:
             if (
-                not entity.get("name", None)
-                or not entity.get("values", None)
-                or not entity.get("type", None)
+                entity.get("name") is None
+                or entity.get("values") is None
+                or entity.get("type") is None
             ):
                 raise ParamError(
                     message="Missing param in entities, a field must have type, name and values"
@@ -463,19 +665,48 @@ class Prepare:
         if not fields_info:
             raise ParamError(message="Missing collection meta to validate entities")
 
-        location, primary_key_loc, auto_id_loc = traverse_info(fields_info, entities)
+        location, primary_key_loc, _ = traverse_info(fields_info)
 
         # though impossible from sdk
         if primary_key_loc is None:
             raise ParamError(message="primary key not found")
 
-        if auto_id_loc is None and len(entities) != len(fields_info):
-            msg = f"number of fields: {len(fields_info)}, number of entities: {len(entities)}"
-            raise ParamError(msg)
+        expected_num_input_fields = Prepare._num_input_fields(fields_info, is_upsert=False)
 
-        if auto_id_loc is not None and len(entities) + 1 != len(fields_info):
-            msg = f"number of fields: {len(fields_info)}, number of entities: {len(entities)}"
-            raise ParamError(msg)
+        if len(entities) != expected_num_input_fields:
+            msg = f"expected number of fields: {expected_num_input_fields}, actual number of fields in entities: {len(entities)}"
+            raise ParamError(message=msg)
+
+        return location
+
+    @staticmethod
+    def _pre_upsert_batch_check(
+        entities: List,
+        fields_info: Any,
+    ):
+        for entity in entities:
+            if (
+                entity.get("name") is None
+                or entity.get("values") is None
+                or entity.get("type") is None
+            ):
+                raise ParamError(
+                    message="Missing param in entities, a field must have type, name and values"
+                )
+        if not fields_info:
+            raise ParamError(message="Missing collection meta to validate entities")
+
+        location, primary_key_loc = traverse_upsert_info(fields_info)
+
+        # though impossible from sdk
+        if primary_key_loc is None:
+            raise ParamError(message="primary key not found")
+
+        expected_num_input_fields = Prepare._num_input_fields(fields_info, is_upsert=True)
+
+        if len(entities) != expected_num_input_fields:
+            msg = f"expected number of fields: {expected_num_input_fields}, actual number of fields in entities: {len(entities)}"
+            raise ParamError(message=msg)
         return location
 
     @staticmethod
@@ -488,18 +719,23 @@ class Prepare:
         pre_field_size = 0
         try:
             for entity in entities:
-                latest_field_size = len(entity.get("values"))
-                if pre_field_size not in (0, latest_field_size):
-                    raise ParamError(
-                        message=(
-                            f"Field data size misaligned for field [{entity.get('name')}] ",
-                            f"got size=[{latest_field_size}] ",
-                            f"alignment size=[{pre_field_size}]",
+                latest_field_size = entity_helper.get_input_num_rows(entity.get("values"))
+                if latest_field_size != 0:
+                    if pre_field_size not in (0, latest_field_size):
+                        raise ParamError(
+                            message=(
+                                f"Field data size misaligned for field [{entity.get('name')}] ",
+                                f"got size=[{latest_field_size}] ",
+                                f"alignment size=[{pre_field_size}]",
+                            )
                         )
-                    )
-                pre_field_size = latest_field_size
+                    pre_field_size = latest_field_size
+            if pre_field_size == 0:
+                raise ParamError(message=ExceptionsMessage.NumberRowsInvalid)
+            request.num_rows = pre_field_size
+            for entity in entities:
                 field_data = entity_helper.entity_to_field_data(
-                    entity, fields_info[location[entity.get("name")]]
+                    entity, fields_info[location[entity.get("name")]], request.num_rows
                 )
                 request.fields_data.append(field_data)
         except (TypeError, ValueError) as e:
@@ -518,7 +754,7 @@ class Prepare:
         partition_name: str,
         fields_info: Any,
     ):
-        location = cls._pre_batch_check(entities, fields_info)
+        location = cls._pre_insert_batch_check(entities, fields_info)
         tag = partition_name if isinstance(partition_name, str) else ""
         request = milvus_types.InsertRequest(collection_name=collection_name, partition_name=tag)
 
@@ -532,7 +768,7 @@ class Prepare:
         partition_name: str,
         fields_info: Any,
     ):
-        location = cls._pre_batch_check(entities, fields_info)
+        location = cls._pre_upsert_batch_check(entities, fields_info)
         tag = partition_name if isinstance(partition_name, str) else ""
         request = milvus_types.UpsertRequest(collection_name=collection_name, partition_name=tag)
 
@@ -542,46 +778,144 @@ class Prepare:
     def delete_request(
         cls,
         collection_name: str,
-        partition_name: str,
-        expr: str,
-        consistency_level: Optional[Union[int, str]],
+        filter: str,
+        partition_name: Optional[str] = None,
+        consistency_level: Optional[Union[int, str]] = None,
+        **kwargs,
     ):
-        def check_str(instr: str, prefix: str):
-            if instr is None:
-                raise ParamError(message=f"{prefix} cannot be None")
-            if not isinstance(instr, str):
-                raise ParamError(message=f"{prefix} value {instr} is illegal")
-            if len(instr) == 0:
-                raise ParamError(message=f"{prefix} cannot be empty")
-
-        check_str(collection_name, "collection_name")
-        if partition_name is not None and partition_name != "":
-            check_str(partition_name, "partition_name")
-        check_str(expr, "expr")
+        check.validate_strs(
+            collection_name=collection_name,
+            filter=filter,
+        )
+        check.validate_nullable_strs(partition_name=partition_name)
 
         return milvus_types.DeleteRequest(
             collection_name=collection_name,
             partition_name=partition_name,
-            expr=expr,
+            expr=filter,
             consistency_level=get_consistency_level(consistency_level),
+            expr_template_values=cls.prepare_expression_template(kwargs.get("expr_params", {})),
         )
 
     @classmethod
-    def _prepare_placeholders(cls, vectors: Any, nq: int, tag: Any, pl_type: Any, is_binary: bool):
-        pl = common_types.PlaceholderValue(tag=tag)
-        pl.type = pl_type
-        for i in range(nq):
-            if is_binary:
-                pl.values.append(blob.vector_binary_to_bytes(vectors[i]))
+    def _prepare_placeholder_str(cls, data: Any):
+        # sparse vector
+        if entity_helper.entity_is_sparse_matrix(data):
+            pl_type = PlaceholderType.SparseFloatVector
+            pl_values = entity_helper.sparse_rows_to_proto(data).contents
+
+        elif isinstance(data[0], np.ndarray):
+            dtype = data[0].dtype
+
+            if dtype == "bfloat16":
+                pl_type = PlaceholderType.BFLOAT16_VECTOR
+                pl_values = (array.tobytes() for array in data)
+            elif dtype == "float16":
+                pl_type = PlaceholderType.FLOAT16_VECTOR
+                pl_values = (array.tobytes() for array in data)
+            elif dtype in ("float32", "float64"):
+                pl_type = PlaceholderType.FloatVector
+                pl_values = (blob.vector_float_to_bytes(entity) for entity in data)
+
+            elif dtype == "byte":
+                pl_type = PlaceholderType.BinaryVector
+                pl_values = data
+
             else:
-                pl.values.append(blob.vector_float_to_bytes(vectors[i]))
-        return pl
+                err_msg = f"unsupported data type: {dtype}"
+                raise ParamError(message=err_msg)
+
+        elif isinstance(data[0], bytes):
+            pl_type = PlaceholderType.BinaryVector
+            pl_values = data  # data is already a list of bytes
+
+        elif isinstance(data[0], str):
+            pl_type = PlaceholderType.VARCHAR
+            pl_values = (value.encode("utf-8") for value in data)
+
+        else:
+            pl_type = PlaceholderType.FloatVector
+            pl_values = (blob.vector_float_to_bytes(entity) for entity in data)
+
+        pl = common_types.PlaceholderValue(tag="$0", type=pl_type, values=pl_values)
+        return common_types.PlaceholderGroup.SerializeToString(
+            common_types.PlaceholderGroup(placeholders=[pl])
+        )
+
+    @classmethod
+    def prepare_expression_template(cls, values: Dict) -> Any:
+        def all_elements_same_type(lst: List):
+            return all(isinstance(item, type(lst[0])) for item in lst)
+
+        def add_array_data(v: List) -> schema_types.TemplateArrayValue:
+            data = schema_types.TemplateArrayValue()
+            if len(v) == 0:
+                return data
+            element_type = (
+                infer_dtype_by_scalar_data(v[0]) if all_elements_same_type(v) else schema_types.JSON
+            )
+            if element_type in (schema_types.Bool,):
+                data.bool_data.data.extend(v)
+                return data
+            if element_type in (
+                schema_types.Int8,
+                schema_types.Int16,
+                schema_types.Int32,
+                schema_types.Int64,
+            ):
+                data.long_data.data.extend(v)
+                return data
+            if element_type in (schema_types.Float, schema_types.Double):
+                data.double_data.data.extend(v)
+                return data
+            if element_type in (schema_types.VarChar, schema_types.String):
+                data.string_data.data.extend(v)
+                return data
+            if element_type in (schema_types.Array,):
+                for e in v:
+                    data.array_data.data.append(add_array_data(e))
+                return data
+            if element_type in (schema_types.JSON,):
+                for e in v:
+                    data.json_data.data.append(entity_helper.convert_to_json(e))
+                return data
+            raise ParamError(message=f"Unsupported element type: {element_type}")
+
+        def add_data(v: Any) -> schema_types.TemplateValue:
+            dtype = infer_dtype_by_scalar_data(v)
+            data = schema_types.TemplateValue()
+            if dtype in (schema_types.Bool,):
+                data.bool_val = v
+                return data
+            if dtype in (
+                schema_types.Int8,
+                schema_types.Int16,
+                schema_types.Int32,
+                schema_types.Int64,
+            ):
+                data.int64_val = v
+                return data
+            if dtype in (schema_types.Float, schema_types.Double):
+                data.float_val = v
+                return data
+            if dtype in (schema_types.VarChar, schema_types.String):
+                data.string_val = v
+                return data
+            if dtype in (schema_types.Array,):
+                data.array_val.CopyFrom(add_array_data(v))
+                return data
+            raise ParamError(message=f"Unsupported element type: {dtype}")
+
+        expression_template_values = {}
+        for k, v in values.items():
+            expression_template_values[k] = add_data(v)
+        return expression_template_values
 
     @classmethod
     def search_requests_with_expr(
         cls,
         collection_name: str,
-        data: List,
+        data: Union[List, utils.SparseMatrixInputType],
         anns_field: str,
         param: Dict,
         limit: int,
@@ -591,13 +925,6 @@ class Prepare:
         round_decimal: int = -1,
         **kwargs,
     ) -> milvus_types.SearchRequest:
-        if isinstance(data[0], bytes):
-            is_binary = True
-            pl_type = PlaceholderType.BinaryVector
-        else:
-            is_binary = False
-            pl_type = PlaceholderType.FloatVector
-
         use_default_consistency = ts_utils.construct_guarantee_ts(collection_name, kwargs)
 
         ignore_growing = param.get("ignore_growing", False) or kwargs.get("ignore_growing", False)
@@ -605,9 +932,22 @@ class Prepare:
         if not isinstance(params, dict):
             raise ParamError(message=f"Search params must be a dict, got {type(params)}")
 
+        if PAGE_RETAIN_ORDER_FIELD in kwargs and PAGE_RETAIN_ORDER_FIELD in param:
+            raise ParamError(
+                message="Provide page_retain_order both in kwargs and param, expect just one"
+            )
+        page_retain_order = kwargs.get(PAGE_RETAIN_ORDER_FIELD) or param.get(
+            PAGE_RETAIN_ORDER_FIELD
+        )
+        if page_retain_order is not None:
+            if not isinstance(page_retain_order, bool):
+                raise ParamError(
+                    message=f"wrong type for page_retain_order, expect bool, got {type(page_retain_order)}"
+                )
+            params[PAGE_RETAIN_ORDER_FIELD] = page_retain_order
+
         search_params = {
             "topk": limit,
-            "params": params,
             "round_decimal": round_decimal,
             "ignore_growing": ignore_growing,
         }
@@ -622,27 +962,60 @@ class Prepare:
                 raise ParamError(message=f"wrong type for offset, expect int, got {type(offset)}")
             search_params["offset"] = offset
 
+        is_iterator = kwargs.get(ITERATOR_FIELD)
+        if is_iterator is not None:
+            search_params[ITERATOR_FIELD] = is_iterator
+
+        collection_id = kwargs.get(COLLECTION_ID)
+        if collection_id is not None:
+            search_params[COLLECTION_ID] = str(collection_id)
+
+        is_search_iter_v2 = kwargs.get(ITER_SEARCH_V2_KEY)
+        if is_search_iter_v2 is not None:
+            search_params[ITER_SEARCH_V2_KEY] = is_search_iter_v2
+
+        search_iter_batch_size = kwargs.get(ITER_SEARCH_BATCH_SIZE_KEY)
+        if search_iter_batch_size is not None:
+            search_params[ITER_SEARCH_BATCH_SIZE_KEY] = search_iter_batch_size
+
+        search_iter_last_bound = kwargs.get(ITER_SEARCH_LAST_BOUND_KEY)
+        if search_iter_last_bound is not None:
+            search_params[ITER_SEARCH_LAST_BOUND_KEY] = search_iter_last_bound
+
+        search_iter_id = kwargs.get(ITER_SEARCH_ID_KEY)
+        if search_iter_id is not None:
+            search_params[ITER_SEARCH_ID_KEY] = search_iter_id
+
         group_by_field = kwargs.get(GROUP_BY_FIELD)
         if group_by_field is not None:
             search_params[GROUP_BY_FIELD] = group_by_field
 
-        if param.get("metric_type", None) is not None:
+        group_size = kwargs.get(GROUP_SIZE)
+        if group_size is not None:
+            search_params[GROUP_SIZE] = group_size
+
+        strict_group_size = kwargs.get(STRICT_GROUP_SIZE)
+        if strict_group_size is not None:
+            search_params[STRICT_GROUP_SIZE] = strict_group_size
+
+        if param.get("metric_type") is not None:
             search_params["metric_type"] = param["metric_type"]
 
         if anns_field:
             search_params["anns_field"] = anns_field
 
-        def dump(v: Dict):
-            if isinstance(v, dict):
-                return ujson.dumps(v)
-            return str(v)
+        if param.get(HINTS) is not None:
+            search_params[HINTS] = param[HINTS]
 
-        nq = len(data)
-        tag = "$0"
-        pl = cls._prepare_placeholders(data, nq, tag, pl_type, is_binary)
-        plg = common_types.PlaceholderGroup()
-        plg.placeholders.append(pl)
-        plg_str = common_types.PlaceholderGroup.SerializeToString(plg)
+        search_params["params"] = get_params(param)
+
+        req_params = [
+            common_types.KeyValuePair(key=str(key), value=utils.dumps(value))
+            for key, value in search_params.items()
+        ]
+        nq = entity_helper.get_input_num_rows(data)
+        plg_str = cls._prepare_placeholder_str(data)
+
         request = milvus_types.SearchRequest(
             collection_name=collection_name,
             partition_names=partition_names,
@@ -651,18 +1024,15 @@ class Prepare:
             use_default_consistency=use_default_consistency,
             consistency_level=kwargs.get("consistency_level", 0),
             nq=nq,
+            placeholder_group=plg_str,
+            dsl_type=common_types.DslType.BoolExprV1,
+            search_params=req_params,
+            expr_template_values=cls.prepare_expression_template(
+                {} if kwargs.get("expr_params") is None else kwargs.get("expr_params")
+            ),
         )
-        request.placeholder_group = plg_str
-
-        request.dsl_type = common_types.DslType.BoolExprV1
         if expr is not None:
             request.dsl = expr
-        request.search_params.extend(
-            [
-                common_types.KeyValuePair(key=str(key), value=dump(value))
-                for key, value in search_params.items()
-            ]
-        )
 
         return request
 
@@ -681,11 +1051,7 @@ class Prepare:
         use_default_consistency = ts_utils.construct_guarantee_ts(collection_name, kwargs)
         rerank_param["limit"] = limit
         rerank_param["round_decimal"] = round_decimal
-
-        def dump(v: Dict):
-            if isinstance(v, dict):
-                return ujson.dumps(v)
-            return str(v)
+        rerank_param["offset"] = kwargs.get("offset", 0)
 
         request = milvus_types.HybridSearchRequest(
             collection_name=collection_name,
@@ -699,10 +1065,46 @@ class Prepare:
 
         request.rank_params.extend(
             [
-                common_types.KeyValuePair(key=str(key), value=dump(value))
+                common_types.KeyValuePair(key=str(key), value=utils.dumps(value))
                 for key, value in rerank_param.items()
             ]
         )
+
+        if kwargs.get(RANK_GROUP_SCORER) is not None:
+            request.rank_params.extend(
+                [
+                    common_types.KeyValuePair(
+                        key=RANK_GROUP_SCORER, value=kwargs.get(RANK_GROUP_SCORER)
+                    )
+                ]
+            )
+
+        if kwargs.get(GROUP_BY_FIELD) is not None:
+            request.rank_params.extend(
+                [
+                    common_types.KeyValuePair(
+                        key=GROUP_BY_FIELD, value=utils.dumps(kwargs.get(GROUP_BY_FIELD))
+                    )
+                ]
+            )
+
+        if kwargs.get(GROUP_SIZE) is not None:
+            request.rank_params.extend(
+                [
+                    common_types.KeyValuePair(
+                        key=GROUP_SIZE, value=utils.dumps(kwargs.get(GROUP_SIZE))
+                    )
+                ]
+            )
+
+        if kwargs.get(STRICT_GROUP_SIZE) is not None:
+            request.rank_params.extend(
+                [
+                    common_types.KeyValuePair(
+                        key=STRICT_GROUP_SIZE, value=utils.dumps(kwargs.get(STRICT_GROUP_SIZE))
+                    )
+                ]
+            )
 
         return request
 
@@ -719,6 +1121,14 @@ class Prepare:
         return milvus_types.AlterAliasRequest(collection_name=collection_name, alias=alias)
 
     @classmethod
+    def describe_alias_request(cls, alias: str):
+        return milvus_types.DescribeAliasRequest(alias=alias)
+
+    @classmethod
+    def list_aliases_request(cls, collection_name: str, db_name: str = ""):
+        return milvus_types.ListAliasesRequest(collection_name=collection_name, db_name=db_name)
+
+    @classmethod
     def create_index_request(cls, collection_name: str, field_name: str, params: Dict, **kwargs):
         index_params = milvus_types.CreateIndexRequest(
             collection_name=collection_name,
@@ -726,28 +1136,32 @@ class Prepare:
             index_name=kwargs.get("index_name", ""),
         )
 
-        def dump(tv: Dict):
-            return ujson.dumps(tv) if isinstance(tv, dict) else str(tv)
-
         if isinstance(params, dict):
             for tk, tv in params.items():
                 if tk == "dim" and (not tv or not isinstance(tv, int)):
                     raise ParamError(message="dim must be of int!")
-                kv_pair = common_types.KeyValuePair(key=str(tk), value=dump(tv))
+                kv_pair = common_types.KeyValuePair(key=str(tk), value=utils.dumps(tv))
                 index_params.extra_params.append(kv_pair)
 
         return index_params
 
     @classmethod
-    def alter_index_request(cls, collection_name: str, index_name: str, extra_params: dict):
-        def dump(tv: Dict):
-            return ujson.dumps(tv) if isinstance(tv, dict) else str(tv)
-
+    def alter_index_properties_request(
+        cls, collection_name: str, index_name: str, properties: dict
+    ):
         params = []
-        for k, v in extra_params.items():
-            params.append(common_types.KeyValuePair(key=str(k), value=dump(v)))
+        for k, v in properties.items():
+            params.append(common_types.KeyValuePair(key=str(k), value=utils.dumps(v)))
         return milvus_types.AlterIndexRequest(
             collection_name=collection_name, index_name=index_name, extra_params=params
+        )
+
+    @classmethod
+    def drop_index_properties_request(
+        cls, collection_name: str, index_name: str, delete_keys: List[str]
+    ):
+        return milvus_types.AlterIndexRequest(
+            collection_name=collection_name, index_name=index_name, delete_keys=delete_keys
         )
 
     @classmethod
@@ -778,6 +1192,8 @@ class Prepare:
         replica_number: int,
         refresh: bool,
         resource_groups: List[str],
+        load_fields: List[str],
+        skip_load_dynamic_field: bool,
     ):
         return milvus_types.LoadCollectionRequest(
             db_name=db_name,
@@ -785,6 +1201,8 @@ class Prepare:
             replica_number=replica_number,
             refresh=refresh,
             resource_groups=resource_groups,
+            load_fields=load_fields,
+            skip_load_dynamic_field=skip_load_dynamic_field,
         )
 
     @classmethod
@@ -802,6 +1220,8 @@ class Prepare:
         replica_number: int,
         refresh: bool,
         resource_groups: List[str],
+        load_fields: List[str],
+        skip_load_dynamic_field: bool,
     ):
         return milvus_types.LoadPartitionsRequest(
             db_name=db_name,
@@ -810,6 +1230,8 @@ class Prepare:
             replica_number=replica_number,
             refresh=refresh,
             resource_groups=resource_groups,
+            load_fields=load_fields,
+            skip_load_dynamic_field=skip_load_dynamic_field,
         )
 
     @classmethod
@@ -895,18 +1317,30 @@ class Prepare:
             guarantee_timestamp=kwargs.get("guarantee_timestamp", 0),
             use_default_consistency=use_default_consistency,
             consistency_level=kwargs.get("consistency_level", 0),
+            expr_template_values=cls.prepare_expression_template(kwargs.get("expr_params", {})),
         )
+        collection_id = kwargs.get(COLLECTION_ID)
+        if collection_id is not None:
+            req.query_params.append(
+                common_types.KeyValuePair(key=COLLECTION_ID, value=str(collection_id))
+            )
 
-        limit = kwargs.get("limit", None)
+        limit = kwargs.get("limit")
         if limit is not None:
             req.query_params.append(common_types.KeyValuePair(key="limit", value=str(limit)))
 
-        offset = kwargs.get("offset", None)
+        offset = kwargs.get("offset")
         if offset is not None:
             req.query_params.append(common_types.KeyValuePair(key="offset", value=str(offset)))
 
         ignore_growing = kwargs.get("ignore_growing", False)
         stop_reduce_for_best = kwargs.get(REDUCE_STOP_FOR_BEST, False)
+        is_iterator = kwargs.get(ITERATOR_FIELD)
+        if is_iterator is not None:
+            req.query_params.append(
+                common_types.KeyValuePair(key=ITERATOR_FIELD, value=is_iterator)
+            )
+
         req.query_params.append(
             common_types.KeyValuePair(key="ignore_growing", value=str(ignore_growing))
         )
@@ -931,12 +1365,17 @@ class Prepare:
         )
 
     @classmethod
-    def manual_compaction(cls, collection_id: int):
+    def manual_compaction(cls, collection_id: int, collection_name: str, is_clustering: bool):
         if collection_id is None or not isinstance(collection_id, int):
             raise ParamError(message=f"collection_id value {collection_id} is illegal")
 
+        if is_clustering is None or not isinstance(is_clustering, bool):
+            raise ParamError(message=f"is_clustering value {is_clustering} is illegal")
+
         request = milvus_types.ManualCompactionRequest()
         request.collectionID = collection_id
+        request.collection_name = collection_name
+        request.majorCompaction = is_clustering
 
         return request
 
@@ -970,7 +1409,7 @@ class Prepare:
 
     @classmethod
     def do_bulk_insert(cls, collection_name: str, partition_name: str, files: list, **kwargs):
-        channel_names = kwargs.get("channel_names", None)
+        channel_names = kwargs.get("channel_names")
         req = milvus_types.ImportRequest(
             collection_name=collection_name,
             partition_name=partition_name,
@@ -980,7 +1419,7 @@ class Prepare:
             req.channel_names.extend(channel_names)
 
         for k, v in kwargs.items():
-            if k in ("bucket",):
+            if k in ("bucket", "backup", "sep", "nullkey"):
                 kv_pair = common_types.KeyValuePair(key=str(k), value=str(v))
                 req.options.append(kv_pair)
 
@@ -990,7 +1429,7 @@ class Prepare:
     def get_bulk_insert_state(cls, task_id: int):
         if task_id is None or not isinstance(task_id, int):
             msg = f"task_id value {task_id} is not an integer"
-            raise ParamError(msg)
+            raise ParamError(message=msg)
 
         return milvus_types.GetImportStateRequest(task=task_id)
 
@@ -998,7 +1437,7 @@ class Prepare:
     def list_bulk_insert_tasks(cls, limit: int, collection_name: str):
         if limit is None or not isinstance(limit, int):
             msg = f"limit value {limit} is not an integer"
-            raise ParamError(msg)
+            raise ParamError(message=msg)
 
         return milvus_types.ListImportTasksRequest(
             collection_name=collection_name,
@@ -1101,6 +1540,33 @@ class Prepare:
         )
 
     @classmethod
+    def operate_privilege_v2_request(
+        cls,
+        role_name: str,
+        privilege: str,
+        operate_privilege_type: Any,
+        db_name: str,
+        collection_name: str,
+    ):
+        check_pass_param(
+            role_name=role_name,
+            privilege=privilege,
+            collection_name=collection_name,
+            operate_privilege_type=operate_privilege_type,
+        )
+        if db_name:
+            check_pass_param(db_name=db_name)
+        return milvus_types.OperatePrivilegeV2Request(
+            role=milvus_types.RoleEntity(name=role_name),
+            grantor=milvus_types.GrantorEntity(
+                privilege=milvus_types.PrivilegeEntity(name=privilege)
+            ),
+            type=operate_privilege_type,
+            db_name=db_name,
+            collection_name=collection_name,
+        )
+
+    @classmethod
     def select_grant_request(cls, role_name: str, object: str, object_name: str, db_name: str):
         check_pass_param(role_name=role_name)
         if object:
@@ -1121,9 +1587,18 @@ class Prepare:
         return milvus_types.GetVersionRequest()
 
     @classmethod
-    def create_resource_group(cls, name: str):
+    def create_resource_group(cls, name: str, **kwargs):
         check_pass_param(resource_group_name=name)
-        return milvus_types.CreateResourceGroupRequest(resource_group=name)
+        return milvus_types.CreateResourceGroupRequest(
+            resource_group=name,
+            config=kwargs.get("config"),
+        )
+
+    @classmethod
+    def update_resource_groups(cls, configs: Mapping[str, ResourceGroupConfig]):
+        return milvus_types.UpdateResourceGroupsRequest(
+            resource_groups=configs,
+        )
 
     @classmethod
     def drop_resource_group(cls, name: str):
@@ -1187,9 +1662,17 @@ class Prepare:
         )
 
     @classmethod
-    def create_database_req(cls, db_name: str):
+    def create_database_req(cls, db_name: str, **kwargs):
         check_pass_param(db_name=db_name)
-        return milvus_types.CreateDatabaseRequest(db_name=db_name)
+
+        req = milvus_types.CreateDatabaseRequest(db_name=db_name)
+        properties = kwargs.get("properties")
+        if is_legal_collection_properties(properties):
+            properties = [
+                common_types.KeyValuePair(key=str(k), value=str(v)) for k, v in properties.items()
+            ]
+            req.properties.extend(properties)
+        return req
 
     @classmethod
     def drop_database_req(cls, db_name: str):
@@ -1199,3 +1682,46 @@ class Prepare:
     @classmethod
     def list_database_req(cls):
         return milvus_types.ListDatabasesRequest()
+
+    @classmethod
+    def alter_database_properties_req(cls, db_name: str, properties: Dict):
+        check_pass_param(db_name=db_name)
+        kvs = [common_types.KeyValuePair(key=k, value=str(v)) for k, v in properties.items()]
+        return milvus_types.AlterDatabaseRequest(db_name=db_name, properties=kvs)
+
+    @classmethod
+    def drop_database_properties_req(cls, db_name: str, property_keys: List[str]):
+        check_pass_param(db_name=db_name)
+        return milvus_types.AlterDatabaseRequest(db_name=db_name, delete_keys=property_keys)
+
+    @classmethod
+    def describe_database_req(cls, db_name: str):
+        check_pass_param(db_name=db_name)
+        return milvus_types.DescribeDatabaseRequest(db_name=db_name)
+
+    @classmethod
+    def create_privilege_group_req(cls, privilege_group: str):
+        check_pass_param(privilege_group=privilege_group)
+        return milvus_types.CreatePrivilegeGroupRequest(group_name=privilege_group)
+
+    @classmethod
+    def drop_privilege_group_req(cls, privilege_group: str):
+        check_pass_param(privilege_group=privilege_group)
+        return milvus_types.DropPrivilegeGroupRequest(group_name=privilege_group)
+
+    @classmethod
+    def list_privilege_groups_req(cls):
+        return milvus_types.ListPrivilegeGroupsRequest()
+
+    @classmethod
+    def operate_privilege_group_req(
+        cls, privilege_group: str, privileges: List[str], operate_privilege_group_type: Any
+    ):
+        check_pass_param(privilege_group=privilege_group)
+        check_pass_param(privileges=privileges)
+        check_pass_param(operate_privilege_group_type=operate_privilege_group_type)
+        return milvus_types.OperatePrivilegeGroupRequest(
+            group_name=privilege_group,
+            privileges=[milvus_types.PrivilegeEntity(name=p) for p in privileges],
+            type=operate_privilege_group_type,
+        )

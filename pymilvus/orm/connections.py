@@ -12,11 +12,13 @@
 
 import copy
 import logging
+import pathlib
 import threading
 import time
 from typing import Callable, Tuple, Union
 from urllib import parse
 
+from pymilvus.client.async_grpc_handler import AsyncGrpcHandler
 from pymilvus.client.check import is_legal_address, is_legal_host, is_legal_port
 from pymilvus.client.grpc_handler import GrpcHandler
 from pymilvus.exceptions import (
@@ -254,14 +256,22 @@ class Connections(metaclass=SingleInstanceMetaClass):
             return address, None
 
         if uri != "":
+            if isinstance(uri, str) and uri.startswith("unix:"):
+                return uri, None
             address, parsed = self.__parse_address_from_uri(uri)
             return address, parsed
 
-        host = host if host != "" else Config.DEFAULT_HOST
-        port = port if port != "" else Config.DEFAULT_PORT
-        self.__verify_host_port(host, port)
+        _host = host if host != "" else Config.DEFAULT_HOST
+        _port = port if port != "" else Config.DEFAULT_PORT
+        self.__verify_host_port(_host, _port)
 
-        return f"{host}:{port}", None
+        addr = f"{_host}:{_port}"
+        if not is_legal_address(addr):
+            raise ConnectionConfigException(
+                message=f"Illegal host: {host} or port: {port}, should be in form of '111.1.1.1', '19530'"
+            )
+
+        return addr, None
 
     def disconnect(self, alias: str):
         """Disconnects connection from the registry.
@@ -274,6 +284,13 @@ class Connections(metaclass=SingleInstanceMetaClass):
 
         if alias in self._connected_alias:
             self._connected_alias.pop(alias).close()
+
+    async def async_disconnect(self, alias: str):
+        if not isinstance(alias, str):
+            raise ConnectionConfigException(message=ExceptionsMessage.AliasType % type(alias))
+
+        if alias in self._connected_alias:
+            await self._connected_alias.pop(alias).close()
 
     def remove_connection(self, alias: str):
         """Removes connection from the registry.
@@ -294,6 +311,7 @@ class Connections(metaclass=SingleInstanceMetaClass):
         password: str = "",
         db_name: str = "default",
         token: str = "",
+        _async: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -348,6 +366,33 @@ class Connections(metaclass=SingleInstanceMetaClass):
             >>> from pymilvus import connections
             >>> connections.connect("test", host="localhost", port="19530")
         """
+        if kwargs.get("uri") and parse.urlparse(kwargs["uri"]).scheme.lower() not in [
+            "unix",
+            "http",
+            "https",
+            "tcp",
+            "grpc",
+        ]:
+            # start and connect milvuslite
+            if not kwargs["uri"].endswith(".db"):
+                raise ConnectionConfigException(
+                    message=f"uri: {kwargs['uri']} is illegal, needs start with [unix, http, https, tcp] or a local file endswith [.db]"
+                )
+            logger.info(f"Pass in the local path {kwargs['uri']}, and run it using milvus-lite")
+            parent_path = pathlib.Path(kwargs["uri"]).parent
+            if not parent_path.is_dir():
+                raise ConnectionConfigException(
+                    message=f"Open local milvus failed, dir: {parent_path} not exists"
+                )
+
+            from milvus_lite.server_manager import (
+                server_manager_instance,
+            )
+
+            local_uri = server_manager_instance.start_and_get_uri(kwargs["uri"])
+            if local_uri is None:
+                raise ConnectionConfigException(message="Open local milvus failed")
+            kwargs["uri"] = local_uri
 
         # kwargs_copy is used for auto reconnect
         kwargs_copy = copy.deepcopy(kwargs)
@@ -357,12 +402,14 @@ class Connections(metaclass=SingleInstanceMetaClass):
         kwargs_copy["token"] = token
 
         def connect_milvus(**kwargs):
-            gh = GrpcHandler(**kwargs)
+            gh = GrpcHandler(**kwargs) if not _async else AsyncGrpcHandler(**kwargs)
 
             t = kwargs.get("timeout")
             timeout = t if isinstance(t, (int, float)) else Config.MILVUS_CONN_TIMEOUT
 
-            gh._wait_for_channel_ready(timeout=timeout)
+            if not _async:
+                gh._wait_for_channel_ready(timeout=timeout)
+
             if kwargs.get("keep_alive", False):
                 gh.register_state_change_callback(
                     ReconnectHandler(self, alias, kwargs_copy).reconnect_on_idle
@@ -495,7 +542,9 @@ class Connections(metaclass=SingleInstanceMetaClass):
             raise ConnectionConfigException(message=ExceptionsMessage.AliasType % type(alias))
         return alias in self._connected_alias
 
-    def _fetch_handler(self, alias: str = Config.MILVUS_CONN_ALIAS) -> GrpcHandler:
+    def _fetch_handler(
+        self, alias: str = Config.MILVUS_CONN_ALIAS
+    ) -> Union[GrpcHandler, AsyncGrpcHandler]:
         """Retrieves a GrpcHandler by alias."""
         if not isinstance(alias, str):
             raise ConnectionConfigException(message=ExceptionsMessage.AliasType % type(alias))

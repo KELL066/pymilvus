@@ -1,17 +1,31 @@
 import time
 from enum import IntEnum
-from typing import Any, ClassVar, Dict, List, TypeVar, Union
+from typing import Any, ClassVar, Dict, List, Optional, TypeVar, Union
 
 from pymilvus.exceptions import (
     AutoIDException,
     ExceptionsMessage,
     InvalidConsistencyLevel,
 )
-from pymilvus.grpc_gen import common_pb2
+from pymilvus.grpc_gen import common_pb2, rg_pb2
 from pymilvus.grpc_gen import milvus_pb2 as milvus_types
 
 Status = TypeVar("Status")
 ConsistencyLevel = common_pb2.ConsistencyLevel
+
+
+# OmitZeroDict: ignore the key-value pairs with value as 0 when printing
+class OmitZeroDict(dict):
+    def omit_zero_len(self):
+        return len(dict(filter(lambda x: x[1], self.items())))
+
+    # filter the key-value pairs with value as 0
+    def __str__(self):
+        return str(dict(filter(lambda x: x[1], self.items())))
+
+    # no filter
+    def __repr__(self):
+        return str(dict(self))
 
 
 class Status:
@@ -89,8 +103,15 @@ class DataType(IntEnum):
     FLOAT_VECTOR = 101
     FLOAT16_VECTOR = 102
     BFLOAT16_VECTOR = 103
+    SPARSE_FLOAT_VECTOR = 104
 
     UNKNOWN = 999
+
+
+class FunctionType(IntEnum):
+    UNKNOWN = 0
+    BM25 = 1
+    TEXTEMBEDDING = 2
 
 
 class RangeType(IntEnum):
@@ -132,7 +153,6 @@ class MetricType(IntEnum):
     HAMMING = 3
     JACCARD = 4
     TANIMOTO = 5
-    #
     SUBSTRUCTURE = 6
     SUPERSTRUCTURE = 7
 
@@ -158,6 +178,8 @@ class PlaceholderType(IntEnum):
     FloatVector = 101
     FLOAT16_VECTOR = 102
     BFLOAT16_VECTOR = 103
+    SparseFloatVector = 104
+    VARCHAR = 21
 
 
 class State(IntEnum):
@@ -227,6 +249,10 @@ class CompactionState:
         self.in_executing = in_executing
         self.in_timeout = in_timeout
         self.completed = completed
+
+    @property
+    def state_name(self):
+        return self.state.name
 
     def __repr__(self) -> str:
         return f"""
@@ -330,6 +356,11 @@ class Shard:
 
 
 class Group:
+    """
+    This class represents replica info in orm format api, which is deprecated in milvus client api.
+    use `ReplicaInfo` instead.
+    """
+
     def __init__(
         self,
         group_id: int,
@@ -374,6 +405,10 @@ class Group:
 
 class Replica:
     """
+    This class represents replica info list in orm format api,
+    which is deprecated in milvus client api.
+    use `List[ReplicaInfo]` instead.
+
     Replica groups:
         - Group: <group_id:2>, <group_nodes:(1, 2, 3)>,
             <shards:[Shard: <shard_id:10>,
@@ -400,6 +435,49 @@ class Replica:
     @property
     def groups(self):
         return self._groups
+
+
+class ReplicaInfo:
+    def __init__(
+        self,
+        replica_id: int,
+        shards: List[str],
+        nodes: List[tuple],
+        resource_group: str,
+        num_outbound_node: dict,
+    ) -> None:
+        self._id = replica_id
+        self._shards = shards
+        self._nodes = tuple(nodes)
+        self._resource_group = resource_group
+        self._num_outbound_node = num_outbound_node
+
+    def __repr__(self) -> str:
+        return (
+            f"ReplicaInfo: <id:{self.id}>, <nodes:{self.group_nodes}>, "
+            f"<shards:{self.shards}>, <resource_group: {self.resource_group}>, "
+            f"<num_outbound_node: {self.num_outbound_node}>"
+        )
+
+    @property
+    def id(self):
+        return self._id
+
+    @property
+    def group_nodes(self):
+        return self._nodes
+
+    @property
+    def shards(self):
+        return self._shards
+
+    @property
+    def resource_group(self):
+        return self._resource_group
+
+    @property
+    def num_outbound_node(self):
+        return self._num_outbound_node
 
 
 class BulkInsertState:
@@ -667,6 +745,51 @@ class GrantInfo:
         return self._groups
 
 
+class PrivilegeGroupItem:
+    def __init__(self, privilege_group: str, privileges: List[milvus_types.PrivilegeEntity]):
+        self._privilege_group = privilege_group
+        privielges = []
+        for privilege in privileges:
+            if isinstance(privilege, milvus_types.PrivilegeEntity):
+                privielges.append(privilege.name)
+        self._privileges = tuple(privielges)
+
+    def __repr__(self) -> str:
+        return f"PrivilegeGroupItem: <privilege_group:{self.privilege_group}>, <privileges:{self.privileges}>"
+
+    @property
+    def privilege_group(self):
+        return self._privilege_group
+
+    @property
+    def privileges(self):
+        return self._privileges
+
+
+class PrivilegeGroupInfo:
+    """
+    PrivilegeGroupInfo groups:
+    - PrivilegeGroupItem: <privilege_group:group>, <privileges:('Load', 'CreateCollection')>
+    """
+
+    def __init__(self, results: List[milvus_types.PrivilegeGroupInfo]) -> None:
+        groups = []
+        for result in results:
+            if isinstance(result, milvus_types.PrivilegeGroupInfo):
+                groups.append(PrivilegeGroupItem(result.group_name, result.privileges))
+        self._groups = groups
+
+    def __repr__(self) -> str:
+        s = "PrivilegeGroupInfo groups:"
+        for g in self.groups:
+            s += f"\n- {g}"
+        return s
+
+    @property
+    def groups(self):
+        return self._groups
+
+
 class UserItem:
     def __init__(self, username: str, entities: List[milvus_types.RoleEntity]) -> None:
         self._username = username
@@ -767,6 +890,8 @@ class ResourceGroupInfo:
         self._num_loaded_replica = resource_group.num_loaded_replica
         self._num_outgoing_node = resource_group.num_outgoing_node
         self._num_incoming_node = resource_group.num_incoming_node
+        self._config = resource_group.config
+        self._nodes = [NodeInfo(node) for node in resource_group.nodes]
 
     def __repr__(self) -> str:
         return f"""ResourceGroupInfo:
@@ -775,7 +900,9 @@ class ResourceGroupInfo:
 <num_available_node:{self.num_available_node}>,
 <num_loaded_replica:{self.num_loaded_replica}>,
 <num_outgoing_node:{self.num_outgoing_node}>,
-<num_incoming_node:{self.num_incoming_node}>"""
+<num_incoming_node:{self.num_incoming_node}>,
+<config:{self.config}>,
+<nodes:{self.nodes}>"""
 
     @property
     def name(self):
@@ -800,3 +927,166 @@ class ResourceGroupInfo:
     @property
     def num_incoming_node(self):
         return self._num_incoming_node
+
+    @property
+    def config(self):
+        return self._config
+
+    @property
+    def nodes(self):
+        return self._nodes
+
+
+class NodeInfo:
+    """
+    Represents information about a node in the system.
+    Attributes:
+        node_id (int): The ID of the node.
+        address (str): The ip address of the node.
+        hostname (str): The hostname of the node.
+    Example:
+        NodeInfo(
+            node_id=1,
+            address="127.0.0.1",
+            hostname="localhost",
+        )
+    """
+
+    def __init__(self, info: Any) -> None:
+        self._node_id = info.node_id
+        self._address = info.address
+        self._hostname = info.hostname
+
+    def __repr__(self) -> str:
+        return f"""NodeInfo:
+<node_id:{self.node_id}>,
+<address:{self.address}>,
+<hostname:{self.hostname}>"""
+
+    @property
+    def node_id(self) -> int:
+        return self._node_id
+
+    @property
+    def address(self) -> str:
+        return self._address
+
+    @property
+    def hostname(self) -> str:
+        return self._hostname
+
+
+ResourceGroupConfig = rg_pb2.ResourceGroupConfig
+"""
+Represents the configuration of a resource group.
+Attributes:
+    requests (ResourceGroupLimit): The requests of the resource group.
+    limits (ResourceGroupLimit): The limits of the resource group.
+    transfer_from (List[ResourceGroupTransfer]): The transfer config that resource group
+        can transfer node from the resource group of this field at high priority.
+    transfer_to (List[ResourceGroupTransfer]): The transfer config that resource group
+        can transfer node to the resource group of this field at high priority.
+Example:
+    ResourceGroupConfig(
+        requests={"node_num": 1},
+        limits={"node_num": 5},
+        transfer_from=[{"resource_group": "__default_resource_group"}],
+        transfer_to=[{"resource_group": "resource_group_2"}],
+    )
+"""
+
+ResourceGroupLimit = rg_pb2.ResourceGroupLimit
+"""
+Represents the limit of a resource group.
+Attributes:
+    node_num (int): The number of nodes that the resource group can hold.
+"""
+
+ResourceGroupTransfer = rg_pb2.ResourceGroupTransfer
+"""
+Represents the transfer config of a resource group.
+Attributes:
+    resource_group (str): The name of the resource group that can be transferred to or from.
+"""
+
+
+class ExtraList(list):
+    """
+    A list that can hold extra information.
+    Attributes:
+        extra (dict): The extra information of the list.
+    Example:
+        ExtraList([1, 2, 3], extra={"total": 3})
+    """
+
+    def __init__(
+        self, *args, extra: Optional[Dict] = None, recalls: Optional[List[float]] = None, **kwargs
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.extra = OmitZeroDict(extra or {})
+        self.recalls = recalls
+
+    def __str__(self) -> str:
+        """Only print at most 10 query results"""
+        recall_msg = (
+            f", recalls: {list(map(str, self.recalls[:10]))}"
+            if self.recalls is not None and len(self.recalls) > 0
+            else ""
+        ) + (
+            f" ... and {len(self.recalls) - 10} recall results remaining"
+            if self.recalls is not None and len(self.recalls) > 10
+            else ""
+        )
+        if self.extra and self.extra.omit_zero_len() != 0:
+            return f"data: {list(map(str, self[:10]))}{' ...' if len(self) > 10 else ''}{recall_msg}, extra_info: {self.extra}"
+        return f"data: {list(map(str, self[:10]))}{' ...' if len(self) > 10 else ''}{recall_msg}"
+
+    __repr__ = __str__
+
+
+def get_cost_from_status(status: Optional[common_pb2.Status] = None):
+    return int(status.extra_info["report_value"] if status and status.extra_info else "0")
+
+
+def get_cost_extra(status: Optional[common_pb2.Status] = None):
+    return {"cost": get_cost_from_status(status)}
+
+
+# Construct extra dict, the cost unit is the vcu, similar to tokenlike the
+def construct_cost_extra(cost: int):
+    return {"cost": cost}
+
+
+class DatabaseInfo:
+    """
+    Represents the information of a database.
+    Atributes:
+        name (str): The name of the database.
+        properties (dict): The properties of the database.
+    Example:
+        DatabaseInfo(name="test_db", id=1, properties={"key": "value"})
+    """
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def properties(self) -> Dict:
+        return self._properties
+
+    def __init__(self, info: Any) -> None:
+        self._name = info.db_name
+        self._properties = {}
+
+        for p in info.properties:
+            self.properties[p.key] = p.value
+
+    def __str__(self) -> str:
+        return f"DatabaseInfo(name={self.name}, properties={self.properties})"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Converts the DatabaseInfo instance to a dictionary."""
+        result = {"name": self.name}
+        result.update(self.properties)
+        return result

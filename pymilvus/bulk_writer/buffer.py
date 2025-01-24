@@ -13,6 +13,7 @@
 import json
 import logging
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -33,21 +34,24 @@ from .constants import (
     BulkFileType,
 )
 
-logger = logging.getLogger("bulk_buffer")
-logger.setLevel(logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 
 class Buffer:
     def __init__(
         self,
         schema: CollectionSchema,
-        file_type: BulkFileType = BulkFileType.NPY,
+        file_type: BulkFileType = BulkFileType.NUMPY,
+        config: Optional[dict] = None,
     ):
         self._buffer = {}
         self._fields = {}
         self._file_type = file_type
+        self._config = config or {}
         for field in schema.fields:
             if field.is_primary and field.auto_id:
+                continue
+            if field.is_function_output:
                 continue
             self._buffer[field.name] = []
             self._fields[field.name] = field
@@ -88,15 +92,15 @@ class Buffer:
         if DYNAMIC_FIELD_NAME in row and not isinstance(row[DYNAMIC_FIELD_NAME], dict):
             self._throw(f"Dynamic field '{DYNAMIC_FIELD_NAME}' value should be JSON format")
 
-        for k in row:
+        for k, v in row.items():
             if k == DYNAMIC_FIELD_NAME:
-                dynamic_values.update(row[k])
+                dynamic_values.update(v)
                 continue
 
             if k not in self._buffer:
-                dynamic_values[k] = self._raw_obj(row[k])
+                dynamic_values[k] = self._raw_obj(v)
             else:
-                self._buffer[k].append(row[k])
+                self._buffer[k].append(v)
 
         if DYNAMIC_FIELD_NAME in self._buffer:
             self._buffer[DYNAMIC_FIELD_NAME].append(dynamic_values)
@@ -108,19 +112,20 @@ class Buffer:
             if row_count < 0:
                 row_count = len(self._buffer[k])
             elif row_count != len(self._buffer[k]):
+                buffer_k_len = len(self._buffer[k])
                 self._throw(
-                    "Column `{}` row count {} doesn't equal to the first column row count {}".format(
-                        k, len(self._buffer[k]), row_count
-                    )
+                    f"Column {k} row count {buffer_k_len} doesn't equal to the first column row count {row_count}"
                 )
 
         # output files
-        if self._file_type == BulkFileType.NPY:
+        if self._file_type == BulkFileType.NUMPY:
             return self._persist_npy(local_path, **kwargs)
-        if self._file_type == BulkFileType.JSON_RB:
+        if self._file_type == BulkFileType.JSON:
             return self._persist_json_rows(local_path, **kwargs)
         if self._file_type == BulkFileType.PARQUET:
             return self._persist_parquet(local_path, **kwargs)
+        if self._file_type == BulkFileType.CSV:
+            return self._persist_csv(local_path, **kwargs)
 
         self._throw(f"Unsupported file tpye: {self._file_type}")
         return []
@@ -150,7 +155,22 @@ class Buffer:
                         str_arr.append(json.dumps(val))
                     self._buffer[k] = str_arr
 
-                arr = np.array(self._buffer[k], dtype=dt)
+                # currently, milvus server doesn't support numpy for sparse vector
+                if field_schema.dtype == DataType.SPARSE_FLOAT_VECTOR:
+                    self._throw(
+                        f"Failed to persist file {full_file_name},"
+                        f" error: milvus doesn't support parsing sparse vectors from numpy file"
+                    )
+
+                # special process for float16 vector, the self._buffer stores bytes for
+                # float16 vector, convert the bytes to uint8 array
+                if field_schema.dtype in {DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR}:
+                    a = []
+                    for b in self._buffer[k]:
+                        a.append(np.frombuffer(b, dtype=dt).tolist())
+                    arr = np.array(a, dtype=dt)
+                else:
+                    arr = np.array(self._buffer[k], dtype=dt)
                 np.save(str(full_file_name), arr)
             except Exception as e:
                 self._throw(f"Failed to persist file {full_file_name}, error: {e}")
@@ -174,7 +194,18 @@ class Buffer:
         while row_index < row_count:
             row = {}
             for k, v in self._buffer.items():
-                row[k] = v[row_index]
+                # special process for float16 vector, the self._buffer stores bytes for
+                # float16 vector, convert the bytes to float list
+                field_schema = self._fields[k]
+                if field_schema.dtype in {DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR}:
+                    dt = (
+                        np.dtype("bfloat16")
+                        if (field_schema.dtype == DataType.BFLOAT16_VECTOR)
+                        else np.float16
+                    )
+                    row[k] = np.frombuffer(v[row_index], dtype=dt).tolist()
+                else:
+                    row[k] = v[row_index]
             rows.append(row)
             row_index = row_index + 1
 
@@ -197,21 +228,31 @@ class Buffer:
         data = {}
         for k in self._buffer:
             field_schema = self._fields[k]
-            if field_schema.dtype == DataType.JSON:
-                # for JSON field, store as string array
+            if field_schema.dtype in {DataType.JSON, DataType.SPARSE_FLOAT_VECTOR}:
+                # for JSON and SPARSE_VECTOR field, store as string array
                 str_arr = []
                 for val in self._buffer[k]:
                     str_arr.append(json.dumps(val))
                 data[k] = pd.Series(str_arr, dtype=None)
-            elif field_schema.dtype == DataType.FLOAT_VECTOR:
+            elif field_schema.dtype in {DataType.BINARY_VECTOR, DataType.FLOAT_VECTOR}:
                 arr = []
                 for val in self._buffer[k]:
-                    arr.append(np.array(val, dtype=np.dtype("float32")))
+                    arr.append(np.array(val, dtype=NUMPY_TYPE_CREATOR[field_schema.dtype.name]))
                 data[k] = pd.Series(arr)
-            elif field_schema.dtype == DataType.BINARY_VECTOR:
+            elif field_schema.dtype in {DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR}:
+                # special process for float16 vector, the self._buffer stores bytes for
+                # float16 vector, convert the bytes to uint8 array
                 arr = []
                 for val in self._buffer[k]:
-                    arr.append(np.array(val, dtype=np.dtype("uint8")))
+                    arr.append(
+                        np.frombuffer(val, dtype=NUMPY_TYPE_CREATOR[field_schema.dtype.name])
+                    )
+                data[k] = pd.Series(arr)
+            elif field_schema.dtype == DataType.ARRAY:
+                dt = NUMPY_TYPE_CREATOR[field_schema.element_type.name]
+                arr = []
+                for val in self._buffer[k]:
+                    arr.append(np.array(val, dtype=dt))
                 data[k] = pd.Series(arr)
             elif field_schema.dtype.name in NUMPY_TYPE_CREATOR:
                 dt = NUMPY_TYPE_CREATOR[field_schema.dtype.name]
@@ -232,10 +273,8 @@ class Buffer:
             buffer_row_count = kwargs.get("buffer_row_count", 1)
             size_per_row = int(buffer_size / buffer_row_count) + 1
             row_group_size = int(row_group_bytes / size_per_row)
-            if row_group_size < row_group_size_min:
-                row_group_size = row_group_size_min
-            if row_group_size > row_group_size_max:
-                row_group_size = row_group_size_max
+            row_group_size = max(row_group_size, row_group_size_min)
+            row_group_size = min(row_group_size, row_group_size_max)
 
         # write to Parquet file
         data_frame = pd.DataFrame(data=data)
@@ -247,4 +286,75 @@ class Buffer:
             f"Successfully persist file {file_path}, total size: {buffer_size},"
             f" row count: {buffer_row_count}, row group size: {row_group_size}"
         )
+        return [str(file_path)]
+
+    def _persist_csv(self, local_path: str, **kwargs):
+        sep = self._config.get("sep", ",")
+        nullkey = self._config.get("nullkey", "")
+
+        header = list(self._buffer.keys())
+        data = pd.DataFrame(columns=header)
+        for k, v in self._buffer.items():
+            field_schema = self._fields[k]
+            # When using df.to_csv(arr) to write non-scalar data,
+            # the repr function is used to convert the data to a string.
+            # if the value of arr is [1.0, 2.0], repr(arr) will change with the type of arr:
+            #   when arr is a list, the output is '[1.0, 2.0]'
+            #   when arr is a tuple, the output is '(1.0, 2.0)'
+            #   when arr is a np.array, the output is '[1.0 2.0]'
+            # we needs the output to be '[1.0, 2.0]', consistent with the array format in json
+            # so 1. whether make sure that arr of type
+            #       (BINARY_VECTOR, FLOAT_VECTOR, FLOAT16_VECTOR, BFLOAT16_VECTOR) is a LIST,
+            #    2. or convert arr into a string using json.dumps(arr) first and then add it to df
+            # I choose method 2 here
+            if field_schema.dtype in {
+                DataType.SPARSE_FLOAT_VECTOR,
+                DataType.BINARY_VECTOR,
+                DataType.FLOAT_VECTOR,
+            }:
+                arr = []
+                for val in v:
+                    arr.append(json.dumps(val))
+                data[k] = pd.Series(arr, dtype=np.dtype("str"))
+            elif field_schema.dtype in {DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR}:
+                # special process for float16 vector, the self._buffer stores bytes for
+                # float16 vector, convert the bytes to float list
+                dt = (
+                    np.dtype("bfloat16")
+                    if (field_schema.dtype == DataType.BFLOAT16_VECTOR)
+                    else np.dtype("float16")
+                )
+                arr = []
+                for val in v:
+                    arr.append(json.dumps(np.frombuffer(val, dtype=dt).tolist()))
+                data[k] = pd.Series(arr, dtype=np.dtype("str"))
+            elif field_schema.dtype in {
+                DataType.JSON,
+                DataType.ARRAY,
+            }:
+                arr = []
+                for val in v:
+                    if val is None:
+                        arr.append(nullkey)
+                    else:
+                        arr.append(json.dumps(val))
+                data[k] = pd.Series(arr, dtype=np.dtype("str"))
+            elif field_schema.dtype in {DataType.BOOL}:
+                arr = []
+                for val in v:
+                    if val is not None:
+                        arr.append("true" if val else "false")
+                data[k] = pd.Series(arr, dtype=np.dtype("str"))
+            else:
+                data[k] = pd.Series(v, dtype=NUMPY_TYPE_CREATOR[field_schema.dtype.name])
+
+        file_path = Path(local_path + ".csv")
+        try:
+            # pd.Series will convert None to np.nan,
+            # so we can use 'na_rep=nullkey' to replace NaN with nullkey
+            data.to_csv(file_path, sep=sep, na_rep=nullkey, index=False)
+        except Exception as e:
+            self._throw(f"Failed to persist file {file_path}, error: {e}")
+
+        logger.info("Successfully persist file %s, row count: %s", file_path, len(data))
         return [str(file_path)]

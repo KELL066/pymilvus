@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, TypeVar, Union
 import pandas as pd
 import ujson
 
+from pymilvus.client import utils
 from pymilvus.client.abstract import BaseRanker, SearchResult
 from pymilvus.client.types import Replica
 from pymilvus.exceptions import MilvusException
@@ -108,7 +109,7 @@ class Partition:
         return self.num_entities == 0
 
     @property
-    def num_entities(self, **kwargs) -> int:
+    def num_entities(self) -> int:
         """int: number of entities in the partition
 
         Examples:
@@ -131,7 +132,7 @@ class Partition:
         """
         conn = self._get_connection()
         stats = conn.get_partition_stats(
-            collection_name=self._collection.name, partition_name=self.name, **kwargs
+            collection_name=self._collection.name, partition_name=self.name
         )
         result = {stat.key: stat.value for stat in stats}
         result["row_count"] = int(result["row_count"])
@@ -171,7 +172,7 @@ class Partition:
         conn = self._get_connection()
         return conn.drop_partition(self._collection.name, self.name, timeout=timeout, **kwargs)
 
-    def load(self, replica_number: int = 1, timeout: Optional[float] = None, **kwargs):
+    def load(self, replica_number: int = 0, timeout: Optional[float] = None, **kwargs):
         """Load the partition data into memory.
 
         Args:
@@ -238,14 +239,14 @@ class Partition:
 
     def insert(
         self,
-        data: Union[List, pd.DataFrame],
+        data: Union[List, pd.DataFrame, utils.SparseMatrixInputType],
         timeout: Optional[float] = None,
         **kwargs,
     ) -> MutationResult:
         """Insert data into the partition, the same as Collection.insert(data, [partition])
 
         Args:
-            data (``list/tuple/pandas.DataFrame``): The specified data to insert
+            data (``list/tuple/pandas.DataFrame/sparse types``): The specified data to insert
             partition_name (``str``): The partition name which the data will be inserted to,
                 if partition name is not passed, then the data will be inserted to default partition
             timeout (``float``, optional): A duration of time in seconds to allow for the RPC
@@ -316,14 +317,14 @@ class Partition:
 
     def upsert(
         self,
-        data: Union[List, pd.DataFrame],
+        data: Union[List, pd.DataFrame, utils.SparseMatrixInputType],
         timeout: Optional[float] = None,
         **kwargs,
     ) -> MutationResult:
         """Upsert data into the collection.
 
         Args:
-            data (``list/tuple/pandas.DataFrame``): The specified data to upsert
+            data (``list/tuple/pandas.DataFrame/sparse types``): The specified data to upsert
             partition_name (``str``): The partition name which the data will be upserted at,
                 if partition name is not passed, then the data will be upserted in default partition
             timeout (``float``, optional): A duration of time in seconds to allow for the RPC.
@@ -356,7 +357,7 @@ class Partition:
 
     def search(
         self,
-        data: List,
+        data: Union[List, utils.SparseMatrixInputType],
         anns_field: str,
         param: Dict,
         limit: int,
@@ -369,7 +370,7 @@ class Partition:
         """Conducts a vector similarity search with an optional boolean expression as filter.
 
         Args:
-            data (``List[List[float]]``): The vectors of search data.
+            data (``List[List[float]]`` or sparse types): The vectors of search data.
                 the length of data is number of query (nq),
                 and the dim of every vector in data must be equal to the vector field of collection.
             anns_field (``str``): The name of the vector field used to search of collection.

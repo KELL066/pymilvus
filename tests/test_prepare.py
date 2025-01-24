@@ -1,11 +1,25 @@
 import pytest
+import json
 
+from pymilvus.client.constants import PAGE_RETAIN_ORDER_FIELD
 from pymilvus.client.prepare import Prepare
 from pymilvus import DataType, MilvusException, CollectionSchema, FieldSchema
 from pymilvus import DefaultConfig
 
 
 class TestPrepare:
+    @pytest.mark.parametrize("coll_name", [None, "", -1, 1.1, []])
+    @pytest.mark.parametrize("expr", [None, "", -1, 1.1, []])
+    def test_delete_request_wrong_coll_name(self, coll_name: str, expr: str):
+        with pytest.raises(MilvusException):
+            Prepare.delete_request(coll_name, expr, None, 0)
+
+    @pytest.mark.parametrize("part_name", [])
+    def test_delete_request_wrong_part_name(self, part_name):
+        with pytest.raises(MilvusException):
+            Prepare.delete_request("coll", "id>1", part_name, 0)
+
+
     def test_search_requests_with_expr_offset(self):
         fields = [
             FieldSchema("pk", DataType.INT64, is_primary=True),
@@ -24,17 +38,26 @@ class TestPrepare:
         search_params = {
             "metric_type": "L2",
             "offset": 10,
+            "params": {"page_retain_order": True}
         }
 
         ret = Prepare.search_requests_with_expr("name", data, "v", search_params, 100)
 
         offset_exists = False
+        page_retain_order_exists = False
+        print(ret.search_params)
         for p in ret.search_params:
             if p.key == "offset":
                 offset_exists = True
                 assert p.value == "10"
+            elif p.key == "params":
+                params = json.loads(p.value)
+                if PAGE_RETAIN_ORDER_FIELD in params:
+                    page_retain_order_exists = True
+                    assert  params[PAGE_RETAIN_ORDER_FIELD] is True
 
         assert offset_exists is True
+        assert page_retain_order_exists is True
 
 
 class TestCreateCollectionRequest:
@@ -101,7 +124,7 @@ class TestCreateCollectionRequest:
 
         c_schema = Prepare.get_schema_from_collection_schema("random", schema)
 
-        assert c_schema.enable_dynamic_field == False
+        assert c_schema.enable_dynamic_field is False
         assert c_schema.name == "random"
         assert len(c_schema.fields) == 2
         assert c_schema.fields[0].name == "field_vector"
@@ -180,6 +203,57 @@ class TestCreateCollectionRequest:
 
         Prepare.row_insert_param("", rows, "", fields_info=schema.to_dict()["fields"], enable_dynamic=True)
 
+    def test_row_insert_param_with_none(self):
+        import numpy as np
+        rng = np.random.default_rng(seed=19530)
+        dim = 8
+        schema = CollectionSchema([
+            FieldSchema("float_vector", DataType.FLOAT_VECTOR, dim=dim),
+            FieldSchema("nullable_field", DataType.INT64, nullable=True),
+            FieldSchema("default_field", DataType.FLOAT, default_value=10),
+            FieldSchema("pk_field", DataType.INT64, is_primary=True, auto_id=True),
+            FieldSchema("float", DataType.DOUBLE),
+        ])
+        rows = [
+            {"float": 1.0,"nullable_field": None, "default_field": None,"float_vector": rng.random((1, dim))[0], "a": 1},
+            {"float": 1.0, "float_vector": rng.random((1, dim))[0], "b": 1},
+        ]
+
+        Prepare.row_insert_param("", rows, "", fields_info=schema.to_dict()["fields"], enable_dynamic=True)
+
+    def test_row_upsert_param_with_auto_id(self):
+        import numpy as np
+        rng = np.random.default_rng(seed=19530)
+        dim = 8
+        schema = CollectionSchema([
+            FieldSchema("float_vector", DataType.FLOAT_VECTOR, dim=dim),
+            FieldSchema("pk_field", DataType.INT64, is_primary=True, auto_id=True),
+            FieldSchema("float", DataType.DOUBLE)
+        ])
+        rows = [
+            {"pk_field":1, "float": 1.0, "float_vector": rng.random((1, dim))[0], "a": 1},
+            {"pk_field":2, "float": 1.0, "float_vector": rng.random((1, dim))[0], "b": 1},
+        ]
+
+        Prepare.row_upsert_param("", rows, "", fields_info=schema.to_dict()["fields"], enable_dynamic=True)
+
+    def test_upsert_param_with_none(self):
+        import numpy as np
+        rng = np.random.default_rng(seed=19530)
+        dim = 8
+        schema = CollectionSchema([
+            FieldSchema("float_vector", DataType.FLOAT_VECTOR, dim=dim),
+            FieldSchema("nullable_field", DataType.INT64, nullable=True),
+            FieldSchema("default_field", DataType.FLOAT, default_value=10),
+            FieldSchema("pk_field", DataType.INT64, is_primary=True, auto_id=True),
+            FieldSchema("float", DataType.DOUBLE),
+        ])
+        rows = [
+            {"pk_field":1, "float": 1.0,"nullable_field": None, "default_field": None,"float_vector": rng.random((1, dim))[0], "a": 1},
+            {"pk_field":2, "float": 1.0, "float_vector": rng.random((1, dim))[0], "b": 1},
+        ]
+
+        Prepare.row_upsert_param("", rows, "", fields_info=schema.to_dict()["fields"], enable_dynamic=True)
 
 class TestAlterCollectionRequest:
     def test_alter_collection_request(self):

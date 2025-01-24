@@ -26,8 +26,7 @@ from .constants import (
     BulkFileType,
 )
 
-logger = logging.getLogger("local_bulk_writer")
-logger.setLevel(logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 
 class LocalBulkWriter(BulkWriter):
@@ -35,11 +34,12 @@ class LocalBulkWriter(BulkWriter):
         self,
         schema: CollectionSchema,
         local_path: str,
-        segment_size: int = 512 * MB,
-        file_type: BulkFileType = BulkFileType.NPY,
+        chunk_size: int = 128 * MB,
+        file_type: BulkFileType = BulkFileType.PARQUET,
+        config: Optional[dict] = None,
         **kwargs,
     ):
-        super().__init__(schema, segment_size, file_type, **kwargs)
+        super().__init__(schema, chunk_size, file_type, config, **kwargs)
         self._local_path = local_path
         self._uuid = str(uuid.uuid4())
         self._flush_count = 0
@@ -94,7 +94,7 @@ class LocalBulkWriter(BulkWriter):
         # in anync mode, the flush thread is asynchronously, other threads can
         # continue to append if the new buffer size is less than target size
         with self._working_thread_lock:
-            if super().buffer_size > super().segment_size:
+            if super().buffer_size > super().chunk_size:
                 self.commit(_async=True)
 
     def commit(self, **kwargs):
@@ -109,7 +109,7 @@ class LocalBulkWriter(BulkWriter):
             f"Prepare to flush buffer, row_count: {super().buffer_row_count}, size: {super().buffer_size}"
         )
         _async = kwargs.get("_async", False)
-        call_back = kwargs.get("call_back", None)
+        call_back = kwargs.get("call_back")
 
         x = Thread(target=self._flush, args=(call_back,))
         logger.info(f"Flush thread begin, name: {x.name}")
@@ -123,22 +123,26 @@ class LocalBulkWriter(BulkWriter):
         logger.info(f"Commit done with async={_async}")
 
     def _flush(self, call_back: Optional[Callable] = None):
-        self._flush_count = self._flush_count + 1
-        target_path = Path.joinpath(self._local_path, str(self._flush_count))
+        try:
+            self._flush_count = self._flush_count + 1
+            target_path = Path.joinpath(self._local_path, str(self._flush_count))
 
-        old_buffer = super()._new_buffer()
-        if old_buffer.row_count > 0:
-            file_list = old_buffer.persist(
-                local_path=str(target_path),
-                buffer_size=self.buffer_size,
-                buffer_row_count=self.buffer_row_count,
-            )
-            self._local_files.append(file_list)
-            if call_back:
-                call_back(file_list)
-
-        del self._working_thread[threading.current_thread().name]
-        logger.info(f"Flush thread done, name: {threading.current_thread().name}")
+            old_buffer = super()._new_buffer()
+            if old_buffer.row_count > 0:
+                file_list = old_buffer.persist(
+                    local_path=str(target_path),
+                    buffer_size=self.buffer_size,
+                    buffer_row_count=self.buffer_row_count,
+                )
+                self._local_files.append(file_list)
+                if call_back:
+                    call_back(file_list)
+        except Exception as e:
+            logger.error(f"Failed to fulsh, error: {e}")
+            raise e from e
+        finally:
+            del self._working_thread[threading.current_thread().name]
+            logger.info(f"Flush thread finished, name: {threading.current_thread().name}")
 
     @property
     def data_path(self):
