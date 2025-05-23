@@ -221,6 +221,7 @@ class Prepare:
             is_clustering_key=field.get("is_clustering_key", False),
             nullable=nullable,
             default_value=field.get("default_value"),
+            element_type=field.get("element_type"),
         )
 
         type_params = field.get("params", {})
@@ -228,7 +229,7 @@ class Prepare:
             raise ParamError(message="params should be dictionary type")
         kvs = [
             common_types.KeyValuePair(
-                key=str(k) if k != "mmap_enabled" else "mmap.enabled", value=str(v)
+                key=str(k) if k != "mmap_enabled" else "mmap.enabled", value=ujson.dumps(v)
             )
             for k, v in type_params.items()
         ]
